@@ -35,3 +35,10 @@ kdb was aimed to created to provide a simple and easy to use tool to build wide 
 Why not kraken2-build?
 
 kraken2-build is a tool provided by Kraken2 to build Kraken2 database. It is a great tool but it is limited to build only Kraken2 database. kdb is a more generic tool which can be used to build databases for Kraken2, Centrifuge, Bracken, etc.
+
+
+Documentation
+=============
+
+- [Kraken2 Database Builder](https://avilpage.com/kdb.html)
+- [Mastering Kraken2](https://avilpage.com/tags/kraken2.html)
