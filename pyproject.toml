@@ -1,18 +1,19 @@
 [project]
 name = "kraken-db-builder"
-version = "0.1.0"
+version = "0.1.1"
 description = "CLI tool to build any kraken2 database with single command"
 readme = "README.md"
 license = {file = "LICENSE.txt"}
 maintainers = [{name = "ChillarAnand", email = "chillar@avilpage.com"}]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Scientific Engineering :: Bio-Informatics",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Typing :: Typed",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Utilities",
 ]
 requires-python = ">=3.8"
 dependencies = [
