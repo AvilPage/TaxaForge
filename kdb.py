@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from pathlib import Path
 
 import click
@@ -47,14 +48,13 @@ def create_cache_dir():
     return cache_dir
 
 
-def download_taxanomy(context):
-    cache_dir = context.params.get('cache_dir')
+def download_taxanomy(cache_dir, skip_maps=None, protein=None):
     taxonomy_path = os.path.join(cache_dir, "taxonomy")
     os.makedirs(taxonomy_path, exist_ok=True)
     os.chdir(taxonomy_path)
 
-    if not context.params.get('skip_maps'):
-        if not context.params.get('protein'):
+    if not skip_maps:
+        if not protein:
             # Define URLs for nucleotide accession to taxon map
             urls = [
                 f"{NCBI_SERVER}/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz",
@@ -77,76 +77,52 @@ def download_taxanomy(context):
     run_cmd(cmd)
 
     logger.info("Decompressing taxonomy data")
-    cmd = f"find . -name '*.gz' | xargs -n 1 -P {context.params['threads']} gunzip -k"
+    cmd = f"find {cache_dir}/taxonomy -name '*.gz' | xargs -n 1 gunzip -k"
     run_cmd(cmd)
 
 
 def run_cmd(cmd):
     logger.info(f"Running command: {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
+    try:
+        subprocess.run(cmd, shell=True, check=True)
+    except subprocess.CalledProcessError:
+        pass
 
 
-def download_genomes(context, db_type):
+def download_genomes(cache_dir, db_type, db_name, threads, force=False):
     organisms = DB_TYPE_CONFIG.get(db_type, [db_type])
-    k2_db_dir = f"k2_{context.params['db_type']}"
-    if context.params.get('force'):
-        shutil.rmtree(k2_db_dir, ignore_errors=True)
+    if force:
+        shutil.rmtree(db_name, ignore_errors=True)
 
-    os.makedirs(k2_db_dir, exist_ok=True)
-
-    cache_dir = context.cache_dir
+    os.makedirs(db_name, exist_ok=True)
+    os.chdir(cache_dir)
 
     for organism in organisms:
         logger.info(f"Downloading genomes for {organism}")
-        os.chdir(cache_dir)
 
-        cmd = f"""ncbi-genome-download --section refseq --format fasta --assembly-level complete --retries 3 --parallel {context.params['threads']} --progress-bar {organism}"""
+        cmd = f"""ncbi-genome-download --section refseq --format fasta --assembly-level complete --retries 3 --parallel {threads} --progress-bar {organism}"""
         logger.info(f"Running command: {cmd}")
         subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # import ncbi_genome_download as ngd
-        # ngd.group = 'fungi'
-        # ngd.progess_bar = True
-        # ngd.format = 'fasta'
-        # ngd.download()
+        cmd = f"find {cache_dir}/refseq/{organism} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
+        run_cmd(cmd)
 
-        # check if gunziped exits, if not unzip all files parallely but keep the original
-        cmd = f"find refseq/{organism} -name '*.gz' | xargs -n 1 -P {context.params['threads']} gunzip -k"
-        # cmd = f"find refseq/{organism} -name '*.gz' | xargs -n 1 -P {context.params['threads']} gunzip -k"
-        logger.info(f"Running command: {cmd}")
-        try:
-            subprocess.run(cmd, shell=True, check=True)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Files already present, skipping gunzip")
+        cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} kraken2-build --db {k2_db_dir} --add-to-library"
+        run_cmd(cmd)
+        logger.info(f"Finished downloading {organism} genomes")
 
-        #     kraken2-build --db $DB --add-to-library "$file"
-        # os.chdir(k2_db_dir)
-        cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {context.params['threads']} kraken2-build --db {k2_db_dir} --add-to-library"
-        logger.info(f"Running command: {cmd}")
-        subprocess.run(cmd, shell=True, check=True)
+    logger.info("Finished downloading all genomes")
 
 
-def build_db(context):
-    k2_db_dir = f"k2_{context.params['db_type']}"
-    cache_dir = context.cache_dir
-
-    if not os.path.exists(f"{k2_db_dir}/taxonomy"):
-        cmd = f"ln -s {cache_dir}/taxonomy {k2_db_dir}/taxonomy"
+def build_db(cache_dir, db_name, threads):
+    if not os.path.exists(f"{db_name}/taxonomy"):
+        cmd = f"ln -s {cache_dir}/taxonomy {db_name}/taxonomy"
         run_cmd(cmd)
     
     os.chdir(cache_dir)
-    cmd = f"kraken2-build --db {k2_db_dir} --build --threads {context.params['threads']}"
+    cmd = f"kraken2-build --db {db_name} --build --threads {threads}"
     logger.info(f"Running command: {cmd}")
     subprocess.run(cmd, shell=True, check=True)
-
-
-def create_assembly(context):
-    logger.info("Creating assembly")
-    k2_db_dir = f"k2_{context.params['db_type']}"
-    os.makedirs(k2_db_dir, exist_ok=True)
-    # add all fasta files
-    cmd = f"find "
-    pass
 
 
 @click.command()
@@ -159,14 +135,22 @@ def main(context, db_type: str, threads: int, cache_dir, force: bool):
     logger.info(f"Building Kraken2 database of type {db_type}")
     run_basic_checks()
 
-    logger.info(f"Using cache directory {context.params.get('cache_dir')}")
+    if cache_dir == '.':
+        cache_dir = os.getcwd()
+        print(cache_dir)
 
-    download_taxanomy(context)
-    download_genomes(context, db_type)
-    build_db(context)
+    db_name = f"k2_{context.params['db_type']}"
 
-    # db_types = [c.strip() for c in db_type.split(',')]
+    logger.info(f"Using cache directory {cache_dir}")
 
+    with ProcessPoolExecutor(max_workers=2) as executor:
+        future1 = executor.submit(download_taxanomy, cache_dir)
+        future2 = executor.submit(download_genomes, cache_dir, db_type, db_name, threads, force)
+
+        future1.result()
+        future2.result()
+
+    build_db(cache_dir, db_name, threads)
 
 
 if __name__ == '__main__':
