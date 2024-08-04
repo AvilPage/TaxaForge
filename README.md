@@ -10,6 +10,8 @@ Usage
 
 ```bash
 kdb --help
+
+kraken-db-builder --help
 ```
 
 To create standard Kraken2 database

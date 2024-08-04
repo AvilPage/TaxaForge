@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 
-import glob
 import logging
 import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
-import tarfile
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import click
