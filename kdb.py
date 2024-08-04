@@ -107,7 +107,7 @@ def download_genomes(cache_dir, db_type, db_name, threads, force=False):
         cmd = f"find {cache_dir}/refseq/{organism} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
         run_cmd(cmd)
 
-        cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} kraken2-build --db {k2_db_dir} --add-to-library"
+        cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
         run_cmd(cmd)
         logger.info(f"Finished downloading {organism} genomes")
 
@@ -121,12 +121,11 @@ def build_db(cache_dir, db_name, threads):
     
     os.chdir(cache_dir)
     cmd = f"kraken2-build --db {db_name} --build --threads {threads}"
-    logger.info(f"Running command: {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
+    run_cmd(cmd)
 
 
 @click.command()
-@click.option('--db-type', default='standard', help='database type to build')
+@click.option('--db-type', default=None, help='database type to build', required=True)
 @click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use')
 @click.option('--cache-dir', default=create_cache_dir(), help='Cache directory')
 @click.option('--force', is_flag=True, help='Force download and build')

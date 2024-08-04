@@ -1,5 +1,5 @@
 [project]
-name = "kdb"
+name = "kraken-db-builder"
 version = "0.1.0"
 description = "CLI tool to build any kraken2 database with single command"
 readme = "README.md"
@@ -8,7 +8,8 @@ maintainers = [{name = "ChillarAnand", email = "chillar@avilpage.com"}]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: BSD License",
+    "License :: OSI Approved :: MIT License",
+    "Scientific Engineering :: Bio-Informatics",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Typing :: Typed",
@@ -21,7 +22,7 @@ dependencies = [
 
 [project.urls]
 Documentation = "https://avilpage.com/kdb.html"
-Source = "https://github.com/avilpage/kdb"
+Source = "https://github.com/avilpage/kraken-db-builder"
 
 [build-system]
 requires = ["flit_core<4"]
@@ -90,3 +91,4 @@ order-by-type = false
 
 [project.scripts]
 kdb = "kdb:main"
+kraken-db-builder = "kdb:main"
