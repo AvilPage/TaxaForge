@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-
+import hashlib
+import json
 import logging
 import multiprocessing
 import os
@@ -22,6 +23,18 @@ NCBI_SERVER = "https://ftp.ncbi.nlm.nih.gov"
 DB_TYPE_CONFIG = {
     'standard': ("archaea", "bacteria", "viral", "plasmid", "human", "UniVec_Core")
 }
+
+
+def hash_file(filename, buf_size=8192):
+    md5 = hashlib.md5()
+    with open(filename, "rb") as in_file:
+        while True:
+            data = in_file.read(buf_size)
+            if not data:
+                break
+            md5.update(data)
+    digest = md5.hexdigest()
+    return digest
 
 
 def run_basic_checks():
@@ -77,6 +90,7 @@ def download_taxanomy(cache_dir, skip_maps=None, protein=None):
     logger.info("Decompressing taxonomy data")
     cmd = f"find {cache_dir}/taxonomy -name '*.gz' | xargs -n 1 gunzip -k"
     run_cmd(cmd)
+    logger.info("Finished downloading taxonomy data")
 
 
 def run_cmd(cmd):
@@ -87,13 +101,19 @@ def run_cmd(cmd):
         pass
 
 
-def download_genomes(cache_dir, db_type, db_name, threads, force=False):
+def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
     organisms = DB_TYPE_CONFIG.get(db_type, [db_type])
     if force:
-        shutil.rmtree(db_name, ignore_errors=True)
+        shutil.rmtree(cwd / db_name, ignore_errors=True)
 
-    os.makedirs(db_name, exist_ok=True)
+    os.makedirs(cwd / db_name, exist_ok=True)
     os.chdir(cache_dir)
+
+    hashes = {}
+    md5_file = cwd / db_name / "library" / "added.md5"
+    if os.path.exists(md5_file):
+        with open(md5_file, "r") as in_file:
+            hashes = json.load(in_file)
 
     for organism in organisms:
         logger.info(f"Downloading genomes for {organism}")
@@ -104,21 +124,41 @@ def download_genomes(cache_dir, db_type, db_name, threads, force=False):
 
         cmd = f"find {cache_dir}/refseq/{organism} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
         run_cmd(cmd)
+        logger.info(f"Finished downloading {organism} genomes")
 
         cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
+
+        files_to_add = []
+
+        files = subprocess.check_output(f"find {cache_dir}/refseq/{organism} -name '*.fna'", shell=True).decode("utf-8").split("\n")
+
+        for file in files:
+            if not file:
+                continue
+            md5sum = hash_file(file)
+            if md5sum in hashes:
+                continue
+            files_to_add.append(file)
+            hashes[md5sum] = file
+
+        os.chdir(cwd)
+        cmd = f"echo {' '.join(files_to_add)} | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
         run_cmd(cmd)
-        logger.info(f"Finished downloading {organism} genomes")
+
+        with open(md5_file, "w") as out_file:
+            json.dump(hashes, out_file)
+
+        logger.info(f"Added downloaded {organism} genomes to library")
 
     logger.info("Finished downloading all genomes")
 
 
-def build_db(cache_dir, db_name, threads):
+def build_db(cache_dir, cwd, db_name, threads):
     if not os.path.exists(f"{db_name}/taxonomy"):
         cmd = f"ln -s {cache_dir}/taxonomy {db_name}/taxonomy"
         run_cmd(cmd)
     
-    os.chdir(cache_dir)
-    cmd = f"kraken2-build --db {db_name} --build --threads {threads}"
+    cmd = f"export OMP_NUM_THREADS={threads}; export KRAKEN2_NUM_THREADS={threads}; kraken2-build --build --db {db_name} --threads {threads}"
     run_cmd(cmd)
 
 
@@ -131,23 +171,26 @@ def build_db(cache_dir, db_name, threads):
 def main(context, db_type: str, threads: int, cache_dir, force: bool):
     logger.info(f"Building Kraken2 database of type {db_type}")
     run_basic_checks()
+    cwd = Path(os.getcwd())
 
     if cache_dir == '.':
-        cache_dir = os.getcwd()
+        cache_dir = cwd
         print(cache_dir)
 
     db_name = f"k2_{context.params['db_type']}"
 
     logger.info(f"Using cache directory {cache_dir}")
 
-    with ProcessPoolExecutor(max_workers=2) as executor:
-        future1 = executor.submit(download_taxanomy, cache_dir)
-        future2 = executor.submit(download_genomes, cache_dir, db_type, db_name, threads, force)
+    # with ProcessPoolExecutor(max_workers=2) as executor:
+    #     future1 = executor.submit(download_taxanomy, cache_dir)
+    #     future2 = executor.submit(download_genomes, cache_dir, db_type, db_name, threads, force)
 
-        future1.result()
-        future2.result()
+        # future1.result()
+        # future2.result()
 
-    build_db(cache_dir, db_name, threads)
+    download_taxanomy(cache_dir)
+    download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
+    build_db(cache_dir, cwd, db_name, threads)
 
 
 if __name__ == '__main__':
