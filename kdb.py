@@ -141,34 +141,47 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
             files_to_add.append(file)
             hashes[md5sum] = file
 
-        os.chdir(cwd)
-        cmd = f"echo {' '.join(files_to_add)} | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
-        run_cmd(cmd)
+        if not files_to_add:
+            logger.info(f"No new genomes to add for {organism}")
+            continue
 
-        with open(md5_file, "w") as out_file:
-            json.dump(hashes, out_file)
+        os.chdir(cwd)
+        batch_size = threads * 10
+        for i in range(0, len(files_to_add), batch_size):
+            batch = files_to_add[i:i + batch_size]
+            cmd = f"echo {' '.join(batch)} | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
+            run_cmd(cmd)
+
+            with open(md5_file, "w") as out_file:
+                json.dump(hashes, out_file)
 
         logger.info(f"Added downloaded {organism} genomes to library")
 
     logger.info("Finished downloading all genomes")
 
 
-def build_db(cache_dir, cwd, db_name, threads):
+def build_db(cache_dir, cwd, db_name, threads, fast_build):
+    os.chdir(cwd)
+
     if not os.path.exists(f"{db_name}/taxonomy"):
         cmd = f"ln -s {cache_dir}/taxonomy {db_name}/taxonomy"
         run_cmd(cmd)
     
     cmd = f"export OMP_NUM_THREADS={threads}; export KRAKEN2_NUM_THREADS={threads}; kraken2-build --build --db {db_name} --threads {threads}"
+    if fast_build:
+        cmd += " --fast-build"
     run_cmd(cmd)
 
 
 @click.command()
 @click.option('--db-type', default=None, help='database type to build', required=True)
+@click.option('--db-name', default=None, help='database name to build')
 @click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use')
 @click.option('--cache-dir', default=create_cache_dir(), help='Cache directory')
 @click.option('--force', is_flag=True, help='Force download and build')
+@click.option('--fast-build', is_flag=True, help='Non deterministic but faster build')
 @click.pass_context
-def main(context, db_type: str, threads: int, cache_dir, force: bool):
+def main(context, db_type: str, db_name, threads: int, cache_dir, force: bool, fast_build: bool):
     logger.info(f"Building Kraken2 database of type {db_type}")
     run_basic_checks()
     cwd = Path(os.getcwd())
@@ -177,7 +190,8 @@ def main(context, db_type: str, threads: int, cache_dir, force: bool):
         cache_dir = cwd
         print(cache_dir)
 
-    db_name = f"k2_{context.params['db_type']}"
+    if not db_name:
+        db_name = f"k2_{context.params['db_type']}"
 
     logger.info(f"Using cache directory {cache_dir}")
 
@@ -190,7 +204,7 @@ def main(context, db_type: str, threads: int, cache_dir, force: bool):
 
     download_taxanomy(cache_dir)
     download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
-    build_db(cache_dir, cwd, db_name, threads)
+    build_db(cache_dir, cwd, db_name, threads, fast_build)
 
 
 if __name__ == '__main__':
