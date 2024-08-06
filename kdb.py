@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import hashlib
 import json
 import logging
@@ -7,10 +8,10 @@ import os
 import shutil
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import click
+import ncbi_genome_download
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -118,9 +119,12 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
     for organism in organisms:
         logger.info(f"Downloading genomes for {organism}")
 
-        cmd = f"""ncbi-genome-download --section refseq --format fasta --assembly-level complete --retries 3 --parallel {threads} --progress-bar {organism}"""
-        logger.info(f"Running command: {cmd}")
-        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ncbi_genome_download.download(
+            section='refseq', groups=organism, file_formats='fasta',
+            progress_bar=True, parallel=threads,
+            assembly_levels=['complete'],
+            # retries=3
+        )
 
         cmd = f"find {cache_dir}/refseq/{organism} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
         run_cmd(cmd)
@@ -160,28 +164,47 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
     logger.info("Finished downloading all genomes")
 
 
-def build_db(cache_dir, cwd, db_name, threads, fast_build):
+def build_db(cache_dir, cwd, db_name, threads, fast_build, rebuild, load_factor):
     os.chdir(cwd)
 
     if not os.path.exists(f"{db_name}/taxonomy"):
         cmd = f"ln -s {cache_dir}/taxonomy {db_name}/taxonomy"
         run_cmd(cmd)
-    
-    cmd = f"export OMP_NUM_THREADS={threads}; export KRAKEN2_NUM_THREADS={threads}; kraken2-build --build --db {db_name} --threads {threads}"
+
+    if rebuild:
+        cmd = f"rm -rf {db_name}/*.k2d"
+        run_cmd(cmd)
+
+    # TODO: Fix issue with macos threads
+    if sys.platform == "darwin":
+        threads = 1
+
+    cmd = f"kraken2-build --build --db {db_name} --threads {threads} --load-factor {load_factor}"
+
     if fast_build:
         cmd += " --fast-build"
+
+    run_cmd(cmd)
+
+    cmd = f"du -sh {db_name}/*.k2d"
     run_cmd(cmd)
 
 
 @click.command()
 @click.option('--db-type', default=None, help='database type to build', required=True)
 @click.option('--db-name', default=None, help='database name to build')
-@click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use')
 @click.option('--cache-dir', default=create_cache_dir(), help='Cache directory')
+@click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use')
+@click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated')
 @click.option('--force', is_flag=True, help='Force download and build')
+@click.option('--rebuild', is_flag=True, help='Clean existing build files and re-build')
 @click.option('--fast-build', is_flag=True, help='Non deterministic but faster build')
 @click.pass_context
-def main(context, db_type: str, db_name, threads: int, cache_dir, force: bool, fast_build: bool):
+def main(
+        context,
+        db_type: str, db_name, cache_dir, threads, load_factor,
+        force: bool, rebuild, fast_build: bool
+):
     logger.info(f"Building Kraken2 database of type {db_type}")
     run_basic_checks()
     cwd = Path(os.getcwd())
@@ -204,7 +227,10 @@ def main(context, db_type: str, db_name, threads: int, cache_dir, force: bool, f
 
     download_taxanomy(cache_dir)
     download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
-    build_db(cache_dir, cwd, db_name, threads, fast_build)
+    build_db(
+        cache_dir, cwd, db_name, threads,
+        fast_build, rebuild, load_factor
+    )
 
 
 if __name__ == '__main__':
