@@ -164,7 +164,10 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
     logger.info("Finished downloading all genomes")
 
 
-def build_db(cache_dir, cwd, db_name, threads, fast_build, rebuild, load_factor):
+def build_db(
+        cache_dir, cwd, db_name, threads, kmer_len,
+        fast_build, rebuild, load_factor
+):
     os.chdir(cwd)
 
     if not os.path.exists(f"{db_name}/taxonomy"):
@@ -179,7 +182,7 @@ def build_db(cache_dir, cwd, db_name, threads, fast_build, rebuild, load_factor)
     if sys.platform == "darwin":
         threads = 1
 
-    cmd = f"kraken2-build --build --db {db_name} --threads {threads} --load-factor {load_factor}"
+    cmd = f"kraken2-build --build --db {db_name} --threads {threads} --load-factor {load_factor} --kmer-len {kmer_len}"
 
     if fast_build:
         cmd += " --fast-build"
@@ -196,13 +199,14 @@ def build_db(cache_dir, cwd, db_name, threads, fast_build, rebuild, load_factor)
 @click.option('--cache-dir', default=create_cache_dir(), help='Cache directory')
 @click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use')
 @click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated')
+@click.option('--kmer-len', default=31, help='Kmer length in bp/aa. Used only in build task')
 @click.option('--force', is_flag=True, help='Force download and build')
 @click.option('--rebuild', is_flag=True, help='Clean existing build files and re-build')
 @click.option('--fast-build', is_flag=True, help='Non deterministic but faster build')
 @click.pass_context
 def main(
         context,
-        db_type: str, db_name, cache_dir, threads, load_factor,
+        db_type: str, db_name, cache_dir, threads, load_factor, kmer_len: int,
         force: bool, rebuild, fast_build: bool
 ):
     logger.info(f"Building Kraken2 database of type {db_type}")
@@ -211,24 +215,16 @@ def main(
 
     if cache_dir == '.':
         cache_dir = cwd
-        print(cache_dir)
 
     if not db_name:
         db_name = f"k2_{context.params['db_type']}"
 
     logger.info(f"Using cache directory {cache_dir}")
 
-    # with ProcessPoolExecutor(max_workers=2) as executor:
-    #     future1 = executor.submit(download_taxanomy, cache_dir)
-    #     future2 = executor.submit(download_genomes, cache_dir, db_type, db_name, threads, force)
-
-        # future1.result()
-        # future2.result()
-
     download_taxanomy(cache_dir)
     download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
     build_db(
-        cache_dir, cwd, db_name, threads,
+        cache_dir, cwd, db_name, threads, kmer_len,
         fast_build, rebuild, load_factor
     )
 
