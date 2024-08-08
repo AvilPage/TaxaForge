@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-
+import contextlib
 import hashlib
+import io
 import json
 import logging
 import multiprocessing
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import click
 import ncbi_genome_download
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -94,10 +96,18 @@ def download_taxanomy(cache_dir, skip_maps=None, protein=None):
     logger.info("Finished downloading taxonomy data")
 
 
-def run_cmd(cmd):
-    logger.info(f"Running command: {cmd}")
+def run_cmd(cmd, return_output=False, no_output=False):
+    if not no_output:
+        logger.info(f"Running command: {cmd}")
+
+    if return_output:
+        return subprocess.check_output(cmd, shell=True).decode("utf-8").split("\n")
+
     try:
-        subprocess.run(cmd, shell=True, check=True)
+        if no_output:
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(cmd, shell=True, check=True)
     except subprocess.CalledProcessError:
         pass
 
@@ -162,42 +172,42 @@ def build_db(
 
 
 def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
-    files_to_add = []
 
     hashes = {}
     md5_file = cwd / db_name / "library" / "added.md5"
+    os.makedirs(cwd / db_name / "library", exist_ok=True)
+
     if os.path.exists(md5_file):
+        logger.info(f"Reading existing md5 hashes")
         with open(md5_file, "r") as in_file:
             hashes = json.load(in_file)
 
     if genomes_dir:
-        files = subprocess.check_output(f"find {genomes_dir} -name '*.fna'", shell=True).decode("utf-8").split("\n")
+        logger.info(f"Adding {genomes_dir} genomes to library")
+        cmd = f"find {genomes_dir} -type f -name '*.fna'"
+        files = run_cmd(cmd, return_output=True)
+        logger.info(f"Found {len(files)} genomes to add")
     else:
         organisms = DB_TYPE_CONFIG.get(db_type, [db_type])
         files = []
         for organism in organisms:
-            org_files = subprocess.check_output(f"find {cache_dir}/refseq/{organism} -name '*.fna'", shell=True).decode("utf-8").split("\n")
+            cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna'"
+            org_files = run_cmd(cmd, return_output=True)
+            logger.info(f"Found {len(org_files)} genomes for {organism}")
             files.extend(org_files)
 
-    for file in files:
+    for file in tqdm(files):
         if not file:
             continue
+        # logger.info(f"Adding genomes {i} to {i + batch_size}")
         md5sum = hash_file(file)
         if md5sum in hashes:
             continue
-        files_to_add.append(file)
+
+        cmd = f"kraken2-build --db {db_name} --add-to-library {file}"
+        run_cmd(cmd, no_output=True)
+
         hashes[md5sum] = file
-
-    if not files_to_add:
-        logger.info(f"No new genomes to add for")
-        return
-
-    os.chdir(cwd)
-    batch_size = threads * 10
-    for i in range(0, len(files_to_add), batch_size):
-        batch = files_to_add[i:i + batch_size]
-        cmd = f"echo {' '.join(batch)} | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
-        run_cmd(cmd)
 
         with open(md5_file, "w") as out_file:
             json.dump(hashes, out_file)
@@ -235,10 +245,10 @@ def main(
 
     logger.info(f"Using cache directory {cache_dir}")
 
-    download_taxanomy(cache_dir)
     if not genomes_dir:
         download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
     add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads)
+    download_taxanomy(cache_dir)
     build_db(
         cache_dir, cwd, db_type, db_name, threads, kmer_len,
         fast_build, rebuild, load_factor
