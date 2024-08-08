@@ -108,17 +108,11 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
         shutil.rmtree(cwd / db_name, ignore_errors=True)
 
     os.makedirs(cwd / db_name, exist_ok=True)
-    os.chdir(cache_dir)
-
-    hashes = {}
-    md5_file = cwd / db_name / "library" / "added.md5"
-    if os.path.exists(md5_file):
-        with open(md5_file, "r") as in_file:
-            hashes = json.load(in_file)
+    os.chdir(cwd)
 
     for organism in organisms:
         logger.info(f"Downloading genomes for {organism}")
-
+        os.chdir(cache_dir)
         ncbi_genome_download.download(
             section='refseq', groups=organism, file_formats='fasta',
             progress_bar=True, parallel=threads,
@@ -130,42 +124,16 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
         run_cmd(cmd)
         logger.info(f"Finished downloading {organism} genomes")
 
-        cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
-
-        files_to_add = []
-
-        files = subprocess.check_output(f"find {cache_dir}/refseq/{organism} -name '*.fna'", shell=True).decode("utf-8").split("\n")
-
-        for file in files:
-            if not file:
-                continue
-            md5sum = hash_file(file)
-            if md5sum in hashes:
-                continue
-            files_to_add.append(file)
-            hashes[md5sum] = file
-
-        if not files_to_add:
-            logger.info(f"No new genomes to add for {organism}")
-            continue
-
-        os.chdir(cwd)
-        batch_size = threads * 10
-        for i in range(0, len(files_to_add), batch_size):
-            batch = files_to_add[i:i + batch_size]
-            cmd = f"echo {' '.join(batch)} | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
-            run_cmd(cmd)
-
-            with open(md5_file, "w") as out_file:
-                json.dump(hashes, out_file)
-
-        logger.info(f"Added downloaded {organism} genomes to library")
+        # os.chdir(cwd)
+        # cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
+        # cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} k2 add-to-library --db {db_name} --files"
+        # run_cmd(cmd)
 
     logger.info("Finished downloading all genomes")
 
 
 def build_db(
-        cache_dir, cwd, db_name, threads, kmer_len,
+        cache_dir, cwd, db_type, db_name, threads, kmer_len,
         fast_build, rebuild, load_factor
 ):
     os.chdir(cwd)
@@ -193,9 +161,54 @@ def build_db(
     run_cmd(cmd)
 
 
+def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
+    files_to_add = []
+
+    hashes = {}
+    md5_file = cwd / db_name / "library" / "added.md5"
+    if os.path.exists(md5_file):
+        with open(md5_file, "r") as in_file:
+            hashes = json.load(in_file)
+
+    if genomes_dir:
+        files = subprocess.check_output(f"find {genomes_dir} -name '*.fna'", shell=True).decode("utf-8").split("\n")
+    else:
+        organisms = DB_TYPE_CONFIG.get(db_type, [db_type])
+        files = []
+        for organism in organisms:
+            org_files = subprocess.check_output(f"find {cache_dir}/refseq/{organism} -name '*.fna'", shell=True).decode("utf-8").split("\n")
+            files.extend(org_files)
+
+    for file in files:
+        if not file:
+            continue
+        md5sum = hash_file(file)
+        if md5sum in hashes:
+            continue
+        files_to_add.append(file)
+        hashes[md5sum] = file
+
+    if not files_to_add:
+        logger.info(f"No new genomes to add for")
+        return
+
+    os.chdir(cwd)
+    batch_size = threads * 10
+    for i in range(0, len(files_to_add), batch_size):
+        batch = files_to_add[i:i + batch_size]
+        cmd = f"echo {' '.join(batch)} | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
+        run_cmd(cmd)
+
+        with open(md5_file, "w") as out_file:
+            json.dump(hashes, out_file)
+
+    logger.info(f"Added downloaded genomes to library")
+
+
 @click.command()
 @click.option('--db-type', default=None, help='database type to build', required=True)
 @click.option('--db-name', default=None, help='database name to build')
+@click.option('--genomes-dir', default=None, help='Directory containing genomes')
 @click.option('--cache-dir', default=create_cache_dir(), help='Cache directory')
 @click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use')
 @click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated')
@@ -206,7 +219,8 @@ def build_db(
 @click.pass_context
 def main(
         context,
-        db_type: str, db_name, cache_dir, threads, load_factor, kmer_len: int,
+        db_type: str, db_name, cache_dir, genomes_dir,
+        threads, load_factor, kmer_len: int,
         force: bool, rebuild, fast_build: bool
 ):
     logger.info(f"Building Kraken2 database of type {db_type}")
@@ -222,9 +236,11 @@ def main(
     logger.info(f"Using cache directory {cache_dir}")
 
     download_taxanomy(cache_dir)
-    download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
+    if not genomes_dir:
+        download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
+    add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads)
     build_db(
-        cache_dir, cwd, db_name, threads, kmer_len,
+        cache_dir, cwd, db_type, db_name, threads, kmer_len,
         fast_build, rebuild, load_factor
     )
 
