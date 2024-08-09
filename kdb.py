@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import atexit
 import contextlib
 import hashlib
 import io
@@ -7,6 +8,7 @@ import logging
 import multiprocessing
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +28,8 @@ NCBI_SERVER = "https://ftp.ncbi.nlm.nih.gov"
 DB_TYPE_CONFIG = {
     'standard': ("archaea", "bacteria", "viral", "plasmid", "human", "UniVec_Core")
 }
+hashes = {}
+md5_file = None
 
 
 def hash_file(filename, buf_size=8192):
@@ -101,7 +105,7 @@ def run_cmd(cmd, return_output=False, no_output=False):
         logger.info(f"Running command: {cmd}")
 
     if return_output:
-        return subprocess.check_output(cmd, shell=True).decode("utf-8").split("\n")
+        return subprocess.check_output(cmd, shell=True).decode("utf-8").strip().split("\n")
 
     try:
         if no_output:
@@ -127,17 +131,11 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
             section='refseq', groups=organism, file_formats='fasta',
             progress_bar=True, parallel=threads,
             assembly_levels=['complete'],
-            # retries=3
         )
 
         cmd = f"find {cache_dir}/refseq/{organism} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
         run_cmd(cmd)
         logger.info(f"Finished downloading {organism} genomes")
-
-        # os.chdir(cwd)
-        # cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} kraken2-build --db {db_name} --add-to-library"
-        # cmd = f"find {cache_dir}/refseq/{organism} -name '*.fna' | xargs -n 1 -P {threads} k2 add-to-library --db {db_name} --files"
-        # run_cmd(cmd)
 
     logger.info("Finished downloading all genomes")
 
@@ -146,10 +144,10 @@ def build_db(
         cache_dir, cwd, db_type, db_name, threads, kmer_len,
         fast_build, rebuild, load_factor
 ):
-    os.chdir(cwd)
+    run_cmd(f"cd {cwd}")
 
     if not os.path.exists(f"{db_name}/taxonomy"):
-        cmd = f"ln -s {cache_dir}/taxonomy {db_name}/taxonomy"
+        cmd = f"ln -s {cache_dir}/taxonomy {db_name}/"
         run_cmd(cmd)
 
     if rebuild:
@@ -171,17 +169,7 @@ def build_db(
     run_cmd(cmd)
 
 
-def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
-
-    hashes = {}
-    md5_file = cwd / db_name / "library" / "added.md5"
-    os.makedirs(cwd / db_name / "library", exist_ok=True)
-
-    if os.path.exists(md5_file):
-        logger.info(f"Reading existing md5 hashes")
-        with open(md5_file, "r") as in_file:
-            hashes = json.load(in_file)
-
+def get_files(genomes_dir, cache_dir, db_type):
     if genomes_dir:
         logger.info(f"Adding {genomes_dir} genomes to library")
         cmd = f"find {genomes_dir} -type f -name '*.fna'"
@@ -196,11 +184,46 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
             logger.info(f"Found {len(org_files)} genomes for {organism}")
             files.extend(org_files)
 
+    return files
+
+
+def save_md5_file(*args, **kwargs):
+    print(args, kwargs)
+    print(len(hashes))
+    global md5_file
+    logger.info("Saving md5 hashes")
+    with open(md5_file, "w") as out_file:
+        json.dump(hashes, out_file)
+
+
+def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
+    # atexit.register(save_md5_file)
+    # signal.signal(signal.SIGTERM, save_md5_file)
+    # signal.signal(signal.SIGINT, save_md5_file)
+
+    run_cmd(f"cd {cwd}")
+
+    global hashes
+    global md5_file
+    md5_file = cwd / db_name / "library" / "added.md5"
+    os.makedirs(cwd / db_name / "library", exist_ok=True)
+
+    if os.path.exists(md5_file):
+        logger.info(f"Reading existing md5 hashes")
+        with open(md5_file, "r") as in_file:
+            hashes = json.load(in_file)
+
+    files = get_files(genomes_dir, cache_dir, db_type)
+
     for file in tqdm(files):
-        if not file:
-            continue
-        # logger.info(f"Adding genomes {i} to {i + batch_size}")
-        md5sum = hash_file(file)
+        if not os.path.exists(f"{file}.md5"):
+            md5sum = hash_file(file)
+            with open(f"{file}.md5", "w") as fh:
+                fh.write(md5sum)
+        else:
+            with open(f"{file}.md5", "r") as in_file:
+                md5sum = in_file.read()
+
         if md5sum in hashes:
             continue
 
@@ -208,7 +231,6 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
         run_cmd(cmd, no_output=True)
 
         hashes[md5sum] = file
-
         with open(md5_file, "w") as out_file:
             json.dump(hashes, out_file)
 
@@ -243,12 +265,22 @@ def main(
     if not db_name:
         db_name = f"k2_{context.params['db_type']}"
 
+    if force:
+        run_cmd(f"rm -rf {db_name}")
+        run_cmd(f"mkdir -p {db_name}")
+
     logger.info(f"Using cache directory {cache_dir}")
+
+    download_taxanomy(cache_dir)
 
     if not genomes_dir:
         download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
-    add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads)
-    download_taxanomy(cache_dir)
+    try:
+        add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads)
+    except KeyboardInterrupt:
+        print("Exiting")
+        save_md5_file()
+        sys.exit(1)
     build_db(
         cache_dir, cwd, db_type, db_name, threads, kmer_len,
         fast_build, rebuild, load_factor
@@ -256,4 +288,9 @@ def main(
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Exiting")
+        save_md5_file()
+        sys.exit(1)
