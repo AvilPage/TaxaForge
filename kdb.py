@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 import atexit
-import contextlib
 import hashlib
-import io
-import json
 import logging
 import multiprocessing
 import os
@@ -28,7 +25,7 @@ NCBI_SERVER = "https://ftp.ncbi.nlm.nih.gov"
 DB_TYPE_CONFIG = {
     'standard': ("archaea", "bacteria", "viral", "plasmid", "human", "UniVec_Core")
 }
-hashes = {}
+hashes = set()
 md5_file = None
 
 
@@ -188,13 +185,12 @@ def get_files(genomes_dir, cache_dir, db_type):
 
 
 def save_md5_file(*args, **kwargs):
-    print(args, kwargs)
-    print(len(hashes))
     global md5_file
-    logger.info("Saving md5 hashes")
+    # save set of md5 hashes to file
     with open(md5_file, "w") as out_file:
-        json.dump(hashes, out_file)
-
+        for line in hashes:
+            out_file.write(line + "\n")
+    logger.info(f"Saved {len(hashes)} md5 hashes")
 
 def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
     # atexit.register(save_md5_file)
@@ -209,9 +205,10 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
     os.makedirs(cwd / db_name / "library", exist_ok=True)
 
     if os.path.exists(md5_file):
-        logger.info(f"Reading existing md5 hashes")
         with open(md5_file, "r") as in_file:
-            hashes = json.load(in_file)
+            hashes = {line.strip() for line in in_file}
+
+        logger.info(f"Found {len(hashes)} md5 hashes in {md5_file}")
 
     files = get_files(genomes_dir, cache_dir, db_type)
 
@@ -230,9 +227,11 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
         cmd = f"kraken2-build --db {db_name} --add-to-library {file}"
         run_cmd(cmd, no_output=True)
 
-        hashes[md5sum] = file
-        with open(md5_file, "w") as out_file:
-            json.dump(hashes, out_file)
+        # append md5sum to file
+        with open(md5_file, "a") as out_file:
+            out_file.write(md5sum + "\n")
+
+        hashes.add(md5sum)
 
     logger.info(f"Added downloaded genomes to library")
 
@@ -279,7 +278,7 @@ def main(
         add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads)
     except KeyboardInterrupt:
         print("Exiting")
-        save_md5_file()
+        # save_md5_file()
         sys.exit(1)
     build_db(
         cache_dir, cwd, db_type, db_name, threads, kmer_len,
