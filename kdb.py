@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-import atexit
+
 import hashlib
 import logging
 import multiprocessing
 import os
 import shutil
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -134,6 +133,7 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
         run_cmd(cmd)
         logger.info(f"Finished downloading {organism} genomes")
 
+    os.chdir(cwd)
     logger.info("Finished downloading all genomes")
 
 
@@ -166,12 +166,16 @@ def build_db(
     run_cmd(cmd)
 
 
-def get_files(genomes_dir, cache_dir, db_type):
+def get_files(genomes_dir, cache_dir, db_type, db_name, threads):
     if genomes_dir:
         logger.info(f"Adding {genomes_dir} genomes to library")
+
+        cmd = f"find {genomes_dir} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
+        run_cmd(cmd)
+
         cmd = f"find {genomes_dir} -type f -name '*.fna'"
         files = run_cmd(cmd, return_output=True)
-        logger.info(f"Found {len(files)} genomes to add")
+        logger.info(f"Found {len(files)} genomes to add to {db_name} library")
     else:
         organisms = DB_TYPE_CONFIG.get(db_type, [db_type])
         files = []
@@ -186,7 +190,6 @@ def get_files(genomes_dir, cache_dir, db_type):
 
 def save_md5_file(*args, **kwargs):
     global md5_file
-    # save set of md5 hashes to file
     with open(md5_file, "w") as out_file:
         for line in hashes:
             out_file.write(line + "\n")
@@ -194,7 +197,6 @@ def save_md5_file(*args, **kwargs):
 
 
 def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
-    run_cmd(f"cd {cwd}")
 
     global hashes
     global md5_file
@@ -207,9 +209,9 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
 
         logger.info(f"Found {len(hashes)} md5 hashes in {md5_file}")
 
-    files = get_files(genomes_dir, cache_dir, db_type)
+    files = get_files(genomes_dir, cache_dir, db_type, db_name, threads)
 
-    for file in tqdm(files, delay=5):
+    for file in tqdm(files):
         if not os.path.exists(f"{file}.md5"):
             md5sum = hash_file(file)
             with open(f"{file}.md5", "w") as fh:
@@ -224,7 +226,6 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
         cmd = f"kraken2-build --db {db_name} --add-to-library {file} --threads {threads}"
         run_cmd(cmd, no_output=True)
 
-        # append md5sum to file
         with open(md5_file, "a") as out_file:
             out_file.write(md5sum + "\n")
 
@@ -234,13 +235,13 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
 
 
 @click.command()
-@click.option('--db-type', default=None, help='database type to build', required=True)
+@click.option('--db-type', default=None, help='database type to build')
 @click.option('--db-name', default=None, help='database name to build')
 @click.option('--genomes-dir', default=None, help='Directory containing genomes')
 @click.option('--cache-dir', default=create_cache_dir(), help='Cache directory')
 @click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use')
 @click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated')
-@click.option('--kmer-len', default=31, help='Kmer length in bp/aa. Used only in build task')
+@click.option('--kmer-len', default=35, help='Kmer length in bp/aa. Used only in build task')
 @click.option('--force', is_flag=True, help='Force download and build')
 @click.option('--rebuild', is_flag=True, help='Clean existing build files and re-build')
 @click.option('--fast-build', is_flag=True, help='Non deterministic but faster build')
