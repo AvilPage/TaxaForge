@@ -192,11 +192,8 @@ def save_md5_file(*args, **kwargs):
             out_file.write(line + "\n")
     logger.info(f"Saved {len(hashes)} md5 hashes")
 
-def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
-    # atexit.register(save_md5_file)
-    # signal.signal(signal.SIGTERM, save_md5_file)
-    # signal.signal(signal.SIGINT, save_md5_file)
 
+def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
     run_cmd(f"cd {cwd}")
 
     global hashes
@@ -212,7 +209,7 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
 
     files = get_files(genomes_dir, cache_dir, db_type)
 
-    for file in tqdm(files):
+    for file in tqdm(files, delay=5):
         if not os.path.exists(f"{file}.md5"):
             md5sum = hash_file(file)
             with open(f"{file}.md5", "w") as fh:
@@ -224,7 +221,7 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
         if md5sum in hashes:
             continue
 
-        cmd = f"kraken2-build --db {db_name} --add-to-library {file}"
+        cmd = f"kraken2-build --db {db_name} --add-to-library {file} --threads {threads}"
         run_cmd(cmd, no_output=True)
 
         # append md5sum to file
@@ -274,12 +271,7 @@ def main(
 
     if not genomes_dir:
         download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
-    try:
-        add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads)
-    except KeyboardInterrupt:
-        print("Exiting")
-        # save_md5_file()
-        sys.exit(1)
+    add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads)
     build_db(
         cache_dir, cwd, db_type, db_name, threads, kmer_len,
         fast_build, rebuild, load_factor
@@ -287,9 +279,4 @@ def main(
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("Exiting")
-        save_md5_file()
-        sys.exit(1)
+    main()
