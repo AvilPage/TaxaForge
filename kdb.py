@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import datetime
 import hashlib
 import logging
 import multiprocessing
@@ -83,16 +83,16 @@ def download_taxanomy(cache_dir, skip_maps=None, protein=None):
     # Download taxonomy tree data
     urls.append(f"{NCBI_SERVER}/pub/taxonomy/taxdump.tar.gz")
 
-    cmd = f"echo {' '.join(urls)} | xargs -n 1 -P 4 wget -c"
-    subprocess.run(cmd, shell=True, check=True)
+    cmd = f"echo {' '.join(urls)} | xargs -n 1 -P 4 wget -q -c"
+    run_cmd(cmd, no_output=True)
 
-    logger.info("Untarring taxonomy tree data")
     cmd = f"tar -k -xvf taxdump.tar.gz"
-    run_cmd(cmd)
+    run_cmd(cmd, no_output=True)
 
     logger.info("Decompressing taxonomy data")
     cmd = f"find {cache_dir}/taxonomy -name '*.gz' | xargs -n 1 gunzip -k"
-    run_cmd(cmd)
+    run_cmd(cmd, no_output=True)
+
     logger.info("Finished downloading taxonomy data")
 
 
@@ -118,7 +118,6 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
         shutil.rmtree(cwd / db_name, ignore_errors=True)
 
     os.makedirs(cwd / db_name, exist_ok=True)
-    os.chdir(cwd)
 
     for organism in organisms:
         logger.info(f"Downloading genomes for {organism}")
@@ -127,6 +126,7 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
             section='refseq', groups=organism, file_formats='fasta',
             progress_bar=True, parallel=threads,
             assembly_levels=['complete'],
+            output=cache_dir
         )
 
         cmd = f"find {cache_dir}/refseq/{organism} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
@@ -139,7 +139,7 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
 
 def build_db(
         cache_dir, cwd, db_type, db_name, threads, kmer_len,
-        fast_build, rebuild, load_factor
+        fast_build, rebuild, load_factor, use_k2
 ):
     run_cmd(f"cd {cwd}")
 
@@ -155,8 +155,12 @@ def build_db(
     if sys.platform == "darwin":
         threads = 1
 
-    cmd = f"kraken2-build --build --db {db_name} --threads {threads} --load-factor {load_factor} --kmer-len {kmer_len}"
+    if use_k2:
+        cmd = f"k2 build"
+    else:
+        cmd = f"kraken2-build --build"
 
+    cmd += f" --db {db_name} --threads {threads} --kmer-len {kmer_len} --load-factor {load_factor}"
     if fast_build:
         cmd += " --fast-build"
 
@@ -170,8 +174,8 @@ def get_files(genomes_dir, cache_dir, db_type, db_name, threads):
     if genomes_dir:
         logger.info(f"Adding {genomes_dir} genomes to library")
 
-        cmd = f"find {genomes_dir} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
-        run_cmd(cmd)
+        # cmd = f"find {genomes_dir} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
+        # run_cmd(cmd)
 
         cmd = f"find {genomes_dir} -type f -name '*.fna'"
         files = run_cmd(cmd, return_output=True)
@@ -196,12 +200,49 @@ def save_md5_file(*args, **kwargs):
     logger.info(f"Saved {len(hashes)} md5 hashes")
 
 
-def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
+def add_to_library(
+        cache_dir, cwd, genomes_dir, db_type, db_name,
+        limit, batch_size, threads, use_k2
+):
+    os.chdir(cwd)
+    os.makedirs(cwd / db_name / "library", exist_ok=True)
+
+    files = get_files(genomes_dir, cache_dir, db_type, db_name, threads)
+    if limit:
+        logger.info(f"Limiting number of genomes to {limit}")
+        files = files[:limit]
+
+    step = batch_size
+    dynamic_step = len(files) // 10
+    step = min(step, dynamic_step)
+    if step == 0:
+        step = 1
+
+    logger.info(f"Using step size of {step}")
+
+    file_count = len(files)
+    start = datetime.datetime.now()
+
+    if use_k2:
+        for index, file in enumerate(files, start=1):
+            if index % step == 0:
+                duration = datetime.datetime.now() - start
+                average_speed = duration / step
+                eta = (file_count - index) * average_speed
+                logger.info(f"{datetime.datetime.now()}: Added {index} genomes in {duration}. ETA: {eta}")
+                start = datetime.datetime.now()
+
+            cmd = f"k2 add-to-library --db {db_name} --files {file}"
+            run_cmd(cmd, no_output=True)
+
+        logger.info(f"Added downloaded genomes to library")
+        end = datetime.datetime.now()
+        print(f"Time taken: {end - start}")
+        return
 
     global hashes
     global md5_file
     md5_file = cwd / db_name / "library" / "added.md5"
-    os.makedirs(cwd / db_name / "library", exist_ok=True)
 
     if os.path.exists(md5_file):
         with open(md5_file, "r") as in_file:
@@ -209,9 +250,14 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
 
         logger.info(f"Found {len(hashes)} md5 hashes in {md5_file}")
 
-    files = get_files(genomes_dir, cache_dir, db_type, db_name, threads)
+    for index, file in enumerate(files, start=1):
+        if index % step == 0:
+            duration = datetime.datetime.now() - start
+            average_speed = duration / step
+            eta = (file_count - index) * average_speed
+            logger.info(f"{datetime.datetime.now()}: Added {index} genomes in {duration}. ETA: {eta}")
+            start = datetime.datetime.now()
 
-    for file in tqdm(files):
         if not os.path.exists(f"{file}.md5"):
             md5sum = hash_file(file)
             with open(f"{file}.md5", "w") as fh:
@@ -231,6 +277,9 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
 
         hashes.add(md5sum)
 
+    end = datetime.datetime.now()
+    print(f"Time taken: {end - start}")
+
     logger.info(f"Added downloaded genomes to library")
 
 
@@ -239,18 +288,21 @@ def add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads):
 @click.option('--db-name', default=None, help='database name to build')
 @click.option('--genomes-dir', default=None, help='Directory containing genomes')
 @click.option('--cache-dir', default=create_cache_dir(), help='Cache directory')
-@click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use')
+@click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use', type=int)
 @click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated')
-@click.option('--kmer-len', default=35, help='Kmer length in bp/aa. Used only in build task')
+@click.option('--kmer-len', default=35, help='Kmer length in bp/aa. Used only in build task', type=int)
+@click.option('--limit', default=None, help='Limit number of genomes to use', type=int)
+@click.option('--batch-size', default=1000, help='Number of genomes to add to library at a time', type=int)
 @click.option('--force', is_flag=True, help='Force download and build')
 @click.option('--rebuild', is_flag=True, help='Clean existing build files and re-build')
 @click.option('--fast-build', is_flag=True, help='Non deterministic but faster build')
+@click.option('--use-k2', is_flag=True, help='Non deterministic but faster build')
 @click.pass_context
 def main(
         context,
         db_type: str, db_name, cache_dir, genomes_dir,
-        threads, load_factor, kmer_len: int,
-        force: bool, rebuild, fast_build: bool
+        threads, load_factor, kmer_len: int, limit: int, batch_size: int,
+        force: bool, rebuild, fast_build: bool, use_k2: bool
 ):
     logger.info(f"Building Kraken2 database of type {db_type}")
     run_basic_checks()
@@ -272,10 +324,14 @@ def main(
 
     if not genomes_dir:
         download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
-    add_to_library(cache_dir, cwd, genomes_dir, db_type, db_name, threads)
+
+    add_to_library(
+        cache_dir, cwd, genomes_dir, db_type, db_name,
+        limit, batch_size, threads, use_k2
+    )
     build_db(
         cache_dir, cwd, db_type, db_name, threads, kmer_len,
-        fast_build, rebuild, load_factor
+        fast_build, rebuild, load_factor, use_k2
     )
 
 

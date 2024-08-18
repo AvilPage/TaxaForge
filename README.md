@@ -20,10 +20,22 @@ To create standard Kraken2 database
 kdb --db-type standard
 ```
 
-Before creating standard database, you can try a smaller database like fungi.
+Before creating a standard database, you can try a smaller database like fungi.
 
 ```bash
 kdb --db-type fungi
+```
+
+To use locally downloaded files, run the following command
+
+```bash
+kdb --db-name k2_test --genomes-dir /path/to/genomes --taxonomy-dir /path/to/taxonomy
+```
+
+To limit the number of genomes in the database, use the `--limit` option
+
+```bash
+kdb --db-name k2_test_100 --genomes-dir /path/to/genomes --limit 1000
 ```
 
 
