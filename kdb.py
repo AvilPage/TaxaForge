@@ -138,7 +138,7 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False):
 
 
 def build_db(
-        cache_dir, cwd, db_type, db_name, threads, kmer_len,
+        cache_dir, cwd, db_type, db_name, threads, kmer_len, min_len,
         fast_build, rebuild, load_factor, use_k2
 ):
     run_cmd(f"cd {cwd}")
@@ -160,7 +160,7 @@ def build_db(
     else:
         cmd = f"kraken2-build --build"
 
-    cmd += f" --db {db_name} --threads {threads} --kmer-len {kmer_len} --load-factor {load_factor}"
+    cmd += f" --db {db_name} --threads {threads} --kmer-len {kmer_len} --minimizer-len {min_len} --load-factor {load_factor}"
     if fast_build:
         cmd += " --fast-build"
 
@@ -174,8 +174,16 @@ def get_files(genomes_dir, cache_dir, db_type, db_name, threads):
     if genomes_dir:
         logger.info(f"Adding {genomes_dir} genomes to library")
 
-        # cmd = f"find {genomes_dir} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
-        # run_cmd(cmd)
+        cmd = f"find {genomes_dir} -name '*.gz' | xargs -n 1 -P {threads} gunzip -k"
+        run_cmd(cmd)
+
+        cmd = f"find {genomes_dir} -name '*.gbff'"
+        files = run_cmd(cmd, return_output=True)
+        for file in files:
+            if os.path.exists(f"{file}.fna"):
+                continue
+            cmd = f"any2fasta -u {file} > {file}.fna"
+            run_cmd(cmd)
 
         cmd = f"find {genomes_dir} -type f -name '*.fna'"
         files = run_cmd(cmd, return_output=True)
@@ -291,6 +299,7 @@ def add_to_library(
 @click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use', type=int)
 @click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated')
 @click.option('--kmer-len', default=35, help='Kmer length in bp/aa. Used only in build task', type=int)
+@click.option('--min-len', default=31, help='Minimizer length in bp/aa. Used only in build task', type=int)
 @click.option('--limit', default=None, help='Limit number of genomes to use', type=int)
 @click.option('--batch-size', default=1000, help='Number of genomes to add to library at a time', type=int)
 @click.option('--force', is_flag=True, help='Force download and build')
@@ -301,7 +310,7 @@ def add_to_library(
 def main(
         context,
         db_type: str, db_name, cache_dir, genomes_dir,
-        threads, load_factor, kmer_len: int, limit: int, batch_size: int,
+        threads, load_factor, kmer_len: int, min_len, limit: int, batch_size: int,
         force: bool, rebuild, fast_build: bool, use_k2: bool
 ):
     logger.info(f"Building Kraken2 database of type {db_type}")
@@ -330,7 +339,7 @@ def main(
         limit, batch_size, threads, use_k2
     )
     build_db(
-        cache_dir, cwd, db_type, db_name, threads, kmer_len,
+        cache_dir, cwd, db_type, db_name, threads, kmer_len, min_len,
         fast_build, rebuild, load_factor, use_k2
     )
 
