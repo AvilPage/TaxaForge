@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
+import concurrent.futures
+import configparser
 import datetime
 import hashlib
 import logging
 import multiprocessing
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 import click
@@ -24,6 +28,11 @@ NCBI_SERVER = "https://ftp.ncbi.nlm.nih.gov"
 DB_TYPE_CONFIG = {
     'standard': ("archaea", "bacteria", "viral", "plasmid", "human", "UniVec_Core")
 }
+REQUIRED_BINS = {
+    'kraken2': "kraken2-build",
+    'ganon2': "ganon",
+    'ganon': "ganon",
+}
 hashes = set()
 md5_file = None
 
@@ -40,26 +49,97 @@ def hash_file(filename, buf_size=8192):
     return digest
 
 
-def run_basic_checks():
-    if not shutil.which("kraken2-build"):
-        logger.error("kraken2-build not found in PATH. Exiting.")
-        sys.exit(1)
-
+def run_basic_checks(tool, use_k2=False):
     if not shutil.which("ncbi-genome-download"):
         logger.error("ncbi-genome-download not found in PATH. Exiting.")
         sys.exit(1)
 
+    if tool not in REQUIRED_BINS:
+        logger.error(f"Unknown tool: {tool}. Supported tools: {', '.join(REQUIRED_BINS)}")
+        sys.exit(1)
+
+    binary = "k2" if (tool == 'kraken2' and use_k2) else REQUIRED_BINS[tool]
+    if not shutil.which(binary):
+        logger.error(f"{binary} not found in PATH. Exiting.")
+        sys.exit(1)
+
 
 def create_cache_dir():
-    # Unix ~/.cache/kdb
-    # macOS ~/Library/Caches/kdb
+    # Unix ~/.cache/taxaforge
+    # macOS ~/Library/Caches/taxaforge
     if sys.platform == "darwin":
-        cache_dir = Path.home() / "Library" / "Caches" / "kdb"
+        cache_dir = Path.home() / "Library" / "Caches" / "taxaforge"
     if sys.platform == "linux":
-        cache_dir = Path.home() / ".cache" / "kdb"
+        cache_dir = Path.home() / ".cache" / "taxaforge"
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+def create_config_dir():
+    # Unix ~/.config/taxaforge
+    # macOS ~/Library/Application Support/taxaforge
+    if sys.platform == "darwin":
+        config_dir = Path.home() / "Library" / "Application Support" / "taxaforge"
+    if sys.platform == "linux":
+        config_dir = Path.home() / ".config" / "taxaforge"
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir
+
+
+CONFIG_SECTION = "taxaforge"
+
+
+def get_config_path():
+    return create_config_dir() / "config.ini"
+
+
+def load_config():
+    parser = configparser.ConfigParser()
+    parser.read(get_config_path())
+    if not parser.has_section(CONFIG_SECTION):
+        parser.add_section(CONFIG_SECTION)
+    return parser
+
+
+def save_config(parser):
+    with open(get_config_path(), "w") as out_file:
+        parser.write(out_file)
+
+
+def download_file(url, position):
+    filename = url.rsplit("/", 1)[-1]
+    existing = os.path.getsize(filename) if os.path.exists(filename) else 0
+
+    request = urllib.request.Request(url)
+    if existing:
+        request.add_header("Range", f"bytes={existing}-")
+
+    with urllib.request.urlopen(request) as response:
+        resumed = response.status == 206
+        total = int(response.headers.get("Content-Length", 0)) + (existing if resumed else 0)
+
+        with open(filename, "ab" if resumed else "wb") as out_file, tqdm(
+            total=total, initial=existing if resumed else 0, unit="B", unit_scale=True,
+            desc=filename, position=position, leave=True
+        ) as bar:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+                bar.update(len(chunk))
+
+
+def download_files(urls, max_workers=4):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(download_file, url, index % max_workers)
+            for index, url in enumerate(urls)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
 
 
 def download_taxanomy(cache_dir, skip_maps=None, protein=None):
@@ -83,15 +163,16 @@ def download_taxanomy(cache_dir, skip_maps=None, protein=None):
     # Download taxonomy tree data
     urls.append(f"{NCBI_SERVER}/pub/taxonomy/taxdump.tar.gz")
 
-    cmd = f"echo {' '.join(urls)} | xargs -n 1 -P 4 wget -q -c"
-    run_cmd(cmd, no_output=True)
+    logger.info(f"Downloading {len(urls)} taxonomy files")
+    download_files(urls)
 
+    logger.info("Extracting taxdump.tar.gz")
     cmd = f"tar -k -xvf taxdump.tar.gz"
-    run_cmd(cmd, no_output=True)
+    run_cmd(cmd)
 
     logger.info("Decompressing taxonomy data")
     cmd = f"find {cache_dir}/taxonomy -name '*.gz' | xargs -n 1 gunzip -k"
-    run_cmd(cmd, no_output=True)
+    run_cmd(cmd)
 
     logger.info("Finished downloading taxonomy data")
 
@@ -167,6 +248,31 @@ def build_db(
     run_cmd(cmd)
 
     cmd = f"du -sh {db_name}/*.k2d"
+    run_cmd(cmd)
+
+
+def build_ganon2(cache_dir, cwd, genomes_dir, db_type, db_name, threads, kmer_len, min_len, level, rebuild):
+    os.chdir(cwd)
+
+    if genomes_dir:
+        input_dirs = [str(genomes_dir)]
+    else:
+        organisms = DB_TYPE_CONFIG.get(db_type, [db_type])
+        input_dirs = [f"{cache_dir}/refseq/{organism}" for organism in organisms]
+
+    if rebuild:
+        cmd = f"rm -f {db_name}.*"
+        run_cmd(cmd)
+
+    cmd = (
+        f"ganon build-custom --input {' '.join(input_dirs)} --input-recursive "
+        f"--taxonomy-files {cache_dir}/taxonomy/nodes.dmp {cache_dir}/taxonomy/names.dmp "
+        f"--db-prefix {db_name} --threads {threads} --kmer-size {kmer_len} "
+        f"--window-size {min_len} --level {level}"
+    )
+    run_cmd(cmd)
+
+    cmd = f"du -sh {db_name}.*"
     run_cmd(cmd)
 
 
@@ -291,41 +397,59 @@ def add_to_library(
     logger.info(f"Added downloaded genomes to library")
 
 
-@click.command()
+@click.group(no_args_is_help=True, epilog=f"Config file: {get_config_path()}")
+def cli():
+    pass
+
+
+@cli.command(no_args_is_help=True, context_settings={"ignore_unknown_options": True})
+@click.option('--tool', default='kraken2', type=click.Choice(list(REQUIRED_BINS)), help='Classifier to build the database for')
 @click.option('--db-type', default=None, help='database type to build')
 @click.option('--db-name', default=None, help='database name to build')
 @click.option('--genomes-dir', default=None, help='Directory containing genomes')
 @click.option('--cache-dir', default=create_cache_dir(), help='Cache directory')
 @click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use', type=int)
-@click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated')
+@click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated. Used only for kraken2')
 @click.option('--kmer-len', default=35, help='Kmer length in bp/aa. Used only in build task', type=int)
-@click.option('--min-len', default=31, help='Minimizer length in bp/aa. Used only in build task', type=int)
+@click.option('--min-len', default=31, help='Minimizer/window length in bp/aa. Used only in build task', type=int)
+@click.option('--level', default='leaves', type=click.Choice(['leaves', 'species', 'genus', 'assembly']), help='Taxonomic level to group sequences by. Used only for ganon2')
 @click.option('--limit', default=None, help='Limit number of genomes to use', type=int)
-@click.option('--batch-size', default=1000, help='Number of genomes to add to library at a time', type=int)
+@click.option('--batch-size', default=1000, help='Number of genomes to add to library at a time. Used only for kraken2', type=int)
 @click.option('--force', is_flag=True, help='Force download and build')
 @click.option('--rebuild', is_flag=True, help='Clean existing build files and re-build')
-@click.option('--fast-build', is_flag=True, help='Non deterministic but faster build')
-@click.option('--use-k2', is_flag=True, help='Non deterministic but faster build')
+@click.option('--fast-build', is_flag=True, help='Non deterministic but faster build. Used only for kraken2')
+@click.option('--use-k2', is_flag=True, help='Use k2 CLI instead of kraken2-build. Used only for kraken2')
+@click.argument('ganon_args', nargs=-1, type=click.UNPROCESSED)
 @click.pass_context
-def main(
+def build(
         context,
-        db_type: str, db_name, cache_dir, genomes_dir,
-        threads, load_factor, kmer_len: int, min_len, limit: int, batch_size: int,
-        force: bool, rebuild, fast_build: bool, use_k2: bool
+        tool: str, db_type: str, db_name, cache_dir, genomes_dir,
+        threads, load_factor, kmer_len: int, min_len, level: str, limit: int, batch_size: int,
+        force: bool, rebuild, fast_build: bool, use_k2: bool, ganon_args
 ):
-    logger.info(f"Building Kraken2 database of type {db_type}")
-    run_basic_checks()
+    if tool in ('ganon', 'ganon2') and ganon_args:
+        logger.info(f"Passing through unrecognized options to native ganon build: {' '.join(ganon_args)}")
+        run_basic_checks(tool, use_k2)
+        cmd = "ganon build " + " ".join(shlex.quote(arg) for arg in ganon_args)
+        run_cmd(cmd)
+        return
+
+    logger.info(f"Building {tool} database of type {db_type}")
+    run_basic_checks(tool, use_k2)
     cwd = Path(os.getcwd())
 
     if cache_dir == '.':
         cache_dir = cwd
 
     if not db_name:
-        db_name = f"k2_{context.params['db_type']}"
+        db_name = f"{tool}_{context.params['db_type']}"
 
     if force:
-        run_cmd(f"rm -rf {db_name}")
-        run_cmd(f"mkdir -p {db_name}")
+        if tool == 'kraken2':
+            run_cmd(f"rm -rf {db_name}")
+            run_cmd(f"mkdir -p {db_name}")
+        else:
+            run_cmd(f"rm -f {db_name}.*")
 
     logger.info(f"Using cache directory {cache_dir}")
 
@@ -334,15 +458,72 @@ def main(
     if not genomes_dir:
         download_genomes(cache_dir, cwd, db_type, db_name, threads, force)
 
-    add_to_library(
-        cache_dir, cwd, genomes_dir, db_type, db_name,
-        limit, batch_size, threads, use_k2
-    )
-    build_db(
-        cache_dir, cwd, db_type, db_name, threads, kmer_len, min_len,
-        fast_build, rebuild, load_factor, use_k2
-    )
+    if tool == 'kraken2':
+        add_to_library(
+            cache_dir, cwd, genomes_dir, db_type, db_name,
+            limit, batch_size, threads, use_k2
+        )
+        build_db(
+            cache_dir, cwd, db_type, db_name, threads, kmer_len, min_len,
+            fast_build, rebuild, load_factor, use_k2
+        )
+    elif tool == 'ganon2':
+        build_ganon2(
+            cache_dir, cwd, genomes_dir, db_type, db_name, threads,
+            kmer_len, min_len, level, rebuild
+        )
+
+
+@cli.group(name='config', invoke_without_command=True)
+@click.pass_context
+def config(context):
+    if context.invoked_subcommand is not None:
+        return
+
+    parser = load_config()
+    items = parser.items(CONFIG_SECTION)
+    if not items:
+        logger.info(f"No config set. Config file: {get_config_path()}")
+        return
+
+    for key, value in items:
+        print(f"{key} = {value}")
+
+
+@config.command(name='get')
+@click.argument('key')
+def config_get(key):
+    parser = load_config()
+    if not parser.has_option(CONFIG_SECTION, key):
+        logger.error(f"{key} not set")
+        sys.exit(1)
+    print(parser.get(CONFIG_SECTION, key))
+
+
+@config.command(name='set')
+@click.argument('key')
+@click.argument('value')
+def config_set(key, value):
+    parser = load_config()
+    parser.set(CONFIG_SECTION, key, value)
+    save_config(parser)
+    logger.info(f"Set {key} = {value}")
+
+
+DOCTOR_BINS = ["ncbi-genome-download", "kraken2-build", "k2", "ganon", "any2fasta", "wget", "tar", "gunzip"]
+
+
+@cli.command(name='doctor')
+def doctor():
+    for binary in DOCTOR_BINS:
+        path = shutil.which(binary)
+        status = path if path else "MISSING"
+        print(f"{binary:<20} {status}")
+
+    print()
+    print(f"Cache dir:   {create_cache_dir()}")
+    print(f"Config file: {get_config_path()}")
 
 
 if __name__ == '__main__':
-    main()
+    cli()

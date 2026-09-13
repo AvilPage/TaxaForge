@@ -1,10 +1,10 @@
 [project]
-name = "kraken-db-builder"
-version = "0.1.1"
-description = "CLI tool to build any kraken2 database with single command"
+name = "taxaforge"
+version = "0.2.0"
+description = "CLI tool to build taxonomic classifier databases (Kraken2, ganon2, ...) with a single command"
 readme = "README.md"
 license = {file = "LICENSE.txt"}
-maintainers = [{name = "ChillarAnand", email = "chillar@avilpage.com"}]
+maintainers = [{name = "ChillarAnand", email = "anand@avilpage.com"}]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -22,15 +22,15 @@ dependencies = [
 ]
 
 [project.urls]
-Documentation = "https://avilpage.com/kdb.html"
-Source = "https://github.com/avilpage/kraken-db-builder"
+Documentation = "https://avilpage.com/taxaforge.html"
+Source = "https://github.com/AvilPage/TaxaForge"
 
 [build-system]
 requires = ["flit_core<4"]
 build-backend = "flit_core.buildapi"
 
 [tool.flit.module]
-name = "kdb"
+name = "taxaforge"
 
 [tool.flit.sdist]
 include = [
@@ -91,5 +91,4 @@ force-single-line = true
 order-by-type = false
 
 [project.scripts]
-kdb = "kdb:main"
-kraken-db-builder = "kdb:main"
+taxaforge = "taxaforge:cli"
