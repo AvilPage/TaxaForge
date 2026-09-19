@@ -353,10 +353,17 @@ def ensure_genome_size_file(cache_dir):
 
 def setup_raptor_shim(shim_dir):
     # Older raptor builds expect --input, but ganon build-custom calls it with --input-file;
-    # this shim rewrites the flag so builds don't fail on that mismatch
+    # this shim rewrites the flag so builds don't fail on that mismatch.
+    # Only rewrite if the installed raptor actually needs the old flag - newer
+    # raptor builds want --input-file, and rewriting there would break them.
     real_raptor = shutil.which("raptor") or "/usr/local/bin/raptor"
+    help_text = subprocess.run(
+        [real_raptor, "layout", "--help"], capture_output=True, text=True
+    ).stdout
+    needs_old_flag = "--input-file" not in help_text
     shim_script = shim_dir / "raptor"
-    content = f"""#!/usr/bin/env bash
+    if needs_old_flag:
+        content = f"""#!/usr/bin/env bash
 REAL_BIN="{real_raptor}"
 args=()
 for arg in "$@"; do
@@ -368,6 +375,10 @@ for arg in "$@"; do
 done
 exec "$REAL_BIN" "${{args[@]}}"
 """
+    else:
+        content = f"""#!/usr/bin/env bash
+exec "{real_raptor}" "$@"
+"""
     shim_script.write_text(content)
     shim_script.chmod(0o755)
     return shim_dir
@@ -377,16 +388,20 @@ INPUT_EXTENSION_CANDIDATES = ["fna.gz", "fna", "fa.gz", "fa", "fasta.gz", "fasta
 
 
 def detect_input_extension(input_dirs):
-    # ganon defaults to fna.gz; genomes-dir may hold uncompressed/differently-named files
+    # ganon defaults to fna.gz; genomes-dir may hold uncompressed/differently-named files.
+    # Mixed dirs (a few stray .gz among mostly .fna) pick by count, not first match, or the
+    # majority format gets silently dropped.
+    counts = {ext: 0 for ext in INPUT_EXTENSION_CANDIDATES}
     for ext in INPUT_EXTENSION_CANDIDATES:
         for input_dir in input_dirs:
             path = Path(input_dir)
-            if path.is_dir() and next(path.rglob(f"*.{ext}"), None):
-                return ext
-    return INPUT_EXTENSION_CANDIDATES[0]
+            if path.is_dir():
+                counts[ext] += sum(1 for _ in path.rglob(f"*.{ext}"))
+    best_ext = max(counts, key=lambda ext: counts[ext])
+    return best_ext if counts[best_ext] else INPUT_EXTENSION_CANDIDATES[0]
 
 
-def run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, min_len, level):
+def run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, min_len, level, from_idx=None, to_idx=None):
     taxa_flag = detect_taxonomy_flag()
     if taxa_flag == "--taxonomy-files":
         tax_args = f"{taxa_flag} {cache_dir}/taxonomy/nodes.dmp {cache_dir}/taxonomy/names.dmp"
@@ -397,14 +412,33 @@ def run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, mi
     genome_size_file = ensure_genome_size_file(cache_dir)
     input_extension = detect_input_extension(input_dirs)
 
+    # ganon has no 'file' taxonomic rank - 'file' means per-file bins, achieved by
+    # omitting --level so it defaults to --input-target (itself defaulting to 'file').
+    # Passing --level file gets silently rejected by ganon and falls back to 'leaves'.
+    level_args = "" if level == "file" else f" --level {level}"
+
+    input_file_list = None
+    if from_idx is not None or to_idx is not None:
+        files = sorted(
+            str(path) for input_dir in input_dirs
+            for path in Path(input_dir).rglob(f"*.{input_extension}")
+        )
+        logger.info(f"Using genome files range [{from_idx}:{to_idx}] out of {len(files)}")
+        files = files[from_idx:to_idx]
+        input_file_list = tempfile.NamedTemporaryFile(mode="w", prefix="ganon_input_", suffix=".tsv", delete=False)
+        input_file_list.write("\n".join(files) + "\n")
+        input_file_list.close()
+        input_args = f"--input-file {shlex.quote(input_file_list.name)}"
+    else:
+        input_args = f"--input {' '.join(input_dirs)} --input-recursive --input-extension {input_extension}"
+
     cmd = (
-        f"ganon build-custom --input {' '.join(input_dirs)} --input-recursive "
-        f"--input-extension {input_extension} "
+        f"ganon build-custom {input_args} "
         f"{tax_args} --taxonomy ncbi "
         f"--ncbi-file-info {' '.join(assembly_summary_paths)} "
         f"--genome-size-files {genome_size_file} "
         f"--db-prefix {db_name} --threads {threads} --kmer-size {kmer_len} "
-        f"--window-size {min_len} --level {level}"
+        f"--window-size {min_len}{level_args}"
     )
 
     with tempfile.TemporaryDirectory(prefix="raptor_shim_") as shim_tmp:
@@ -415,12 +449,14 @@ def run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, mi
             run_cmd(cmd)
         finally:
             os.environ["PATH"] = old_path
+            if input_file_list:
+                os.unlink(input_file_list.name)
 
     cmd = f"du -sh {db_name}.*"
     run_cmd(cmd)
 
 
-def build_ganon2(cache_dir, cwd, genomes_dir, db_type, db_name, threads, kmer_len, min_len, level, rebuild):
+def build_ganon2(cache_dir, cwd, genomes_dir, db_type, db_name, threads, kmer_len, min_len, level, rebuild, from_idx=None, to_idx=None):
     os.chdir(cwd)
 
     if genomes_dir:
@@ -434,7 +470,7 @@ def build_ganon2(cache_dir, cwd, genomes_dir, db_type, db_name, threads, kmer_le
         run_cmd(cmd)
 
     os.chdir(cwd)
-    run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, min_len, level)
+    run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, min_len, level, from_idx, to_idx)
 
 
 FILTER_DOWNLOAD_PASSES = {
@@ -462,7 +498,7 @@ def ensure_filtered_genomes(cache_dir, organism, threads, filter_code, seed_dirs
     return organism_dir
 
 
-def build_filtered_ganon(cache_dir, db_prefix, organism_groups, filter_code, ganon_args, seed_dirs=None, download_only=False):
+def build_filtered_ganon(cache_dir, db_prefix, organism_groups, filter_code, ganon_args, seed_dirs=None, download_only=False, from_idx=None, to_idx=None):
     # cgrg-style combined filter: download via ncbi-genome-download instead of ganon's own
     # --genome-updater -F filter, then hand the files to build-custom
     logger.info(f"Filtered ({filter_code}) build for organism groups: {', '.join(organism_groups)} via ncbi-genome-download + ganon build-custom")
@@ -475,7 +511,7 @@ def build_filtered_ganon(cache_dir, db_prefix, organism_groups, filter_code, gan
     if download_only:
         logger.info("Downloaded filtered genomes, skipping build (--download-only)")
         return
-    run_ganon_build_custom(cache_dir, input_dirs, db_prefix, threads, kmer_len, min_len, level)
+    run_ganon_build_custom(cache_dir, input_dirs, db_prefix, threads, kmer_len, min_len, level, from_idx, to_idx)
 
 
 def detect_filter_code(ganon_args):
@@ -489,7 +525,7 @@ def detect_filter_code(ganon_args):
     return None
 
 
-def build_combo_ganon(cache_dir, db_prefix, organism_groups, ganon_args, seed_dirs=None, download_only=False):
+def build_combo_ganon(cache_dir, db_prefix, organism_groups, ganon_args, seed_dirs=None, download_only=False, from_idx=None, to_idx=None):
     # Combo db-prefix (e.g. archaea+viral): download each organism group into its own
     # persistent cache dir and reuse ganon build-custom, instead of native `ganon build`
     # which would re-download the whole combo as a single genome_updater job every time
@@ -507,7 +543,7 @@ def build_combo_ganon(cache_dir, db_prefix, organism_groups, ganon_args, seed_di
         return
 
     input_dirs = [f"{cache_dir}/refseq/{organism}" for organism in organism_groups]
-    run_ganon_build_custom(cache_dir, input_dirs, db_prefix, threads, kmer_len, min_len, level)
+    run_ganon_build_custom(cache_dir, input_dirs, db_prefix, threads, kmer_len, min_len, level, from_idx, to_idx)
 
 
 def get_files(genomes_dir, cache_dir, db_type, db_name, threads):
@@ -550,13 +586,16 @@ def save_md5_file(*args, **kwargs):
 
 def add_to_library(
         cache_dir, cwd, genomes_dir, db_type, db_name,
-        limit, batch_size, threads, use_k2
+        limit, from_idx, to_idx, batch_size, threads, use_k2
 ):
     os.chdir(cwd)
     os.makedirs(cwd / db_name / "library", exist_ok=True)
 
     files = get_files(genomes_dir, cache_dir, db_type, db_name, threads)
-    if limit:
+    if from_idx is not None or to_idx is not None:
+        logger.info(f"Using genome files range [{from_idx}:{to_idx}] out of {len(files)}")
+        files = files[from_idx:to_idx]
+    elif limit:
         logger.info(f"Limiting number of genomes to {limit}")
         files = files[:limit]
 
@@ -765,8 +804,10 @@ def cli():
 @click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated. Used only for kraken2')
 @click.option('--kmer-len', default=35, help='Kmer length in bp/aa. Used only in build task', type=int)
 @click.option('--min-len', default=31, help='Minimizer/window length in bp/aa. Used only in build task', type=int)
-@click.option('--level', default='leaves', type=click.Choice(['leaves', 'species', 'genus', 'assembly']), help='Taxonomic level to group sequences by. Used only for ganon2')
+@click.option('--level', default='leaves', type=click.Choice(['leaves', 'species', 'genus', 'assembly', 'file']), help='Taxonomic level to group sequences by. Used only for ganon2')
 @click.option('--limit', default=None, help='Limit number of genomes to use', type=int)
+@click.option('--from', 'from_idx', default=None, help='Start index of genome files range, for testing a small slice first. Used only for kraken2', type=int)
+@click.option('--to', 'to_idx', default=None, help='End index of genome files range, for testing a small slice first. Used only for kraken2', type=int)
 @click.option('--batch-size', default=1000, help='Number of genomes to add to library at a time. Used only for kraken2', type=int)
 @click.option('--force', is_flag=True, help='Force download and build')
 @click.option('--rebuild', is_flag=True, help='Clean existing build files and re-build')
@@ -778,7 +819,7 @@ def cli():
 def build(
         context,
         tool: str, db_type: str, db_name, cache_dir, output_dir, genomes_dir, seed_dirs,
-        threads, load_factor, kmer_len: int, min_len, level: str, limit: int, batch_size: int,
+        threads, load_factor, kmer_len: int, min_len, level: str, limit: int, from_idx: int, to_idx: int, batch_size: int,
         force: bool, rebuild, fast_build: bool, use_k2: bool, download_only: bool, ganon_args
 ):
     output_dir = Path(output_dir).expanduser().resolve()
@@ -798,6 +839,17 @@ def build(
             elif arg.startswith('--db-prefix='):
                 db_prefix_value = arg.split('=', 1)[1]
 
+        if not db_prefix_value and db_name:
+            db_prefix_value = db_name
+            ganon_args += ['-d', db_name]
+
+        if db_prefix_value and genomes_dir:
+            if download_only:
+                logger.info(f"Genomes dir {genomes_dir} provided, nothing to download (--download-only)")
+                return
+            run_ganon_build_custom(cache_dir, [str(genomes_dir)], db_prefix_value, threads, kmer_len, min_len, level, from_idx, to_idx)
+            return
+
         if db_prefix_value:
             for category, tokens in infer_ganon_options(db_prefix_value).items():
                 aliases = CATEGORY_ARG_ALIASES[category]
@@ -809,10 +861,10 @@ def build(
         organism_groups = get_arg_values(ganon_args, '-g', '--organism-group')
         filter_code = detect_filter_code(ganon_args)
         if db_prefix_value and organism_groups and filter_code:
-            build_filtered_ganon(cache_dir, db_prefix_value, organism_groups, filter_code, ganon_args, seed_dirs, download_only)
+            build_filtered_ganon(cache_dir, db_prefix_value, organism_groups, filter_code, ganon_args, seed_dirs, download_only, from_idx, to_idx)
             return
         if db_prefix_value and len(organism_groups) > 1:
-            build_combo_ganon(cache_dir, db_prefix_value, organism_groups, ganon_args, seed_dirs, download_only)
+            build_combo_ganon(cache_dir, db_prefix_value, organism_groups, ganon_args, seed_dirs, download_only, from_idx, to_idx)
             return
 
         if download_only:
@@ -824,13 +876,7 @@ def build(
             logger.info(f"Reusing cached taxonomy files at {taxdump}")
             ganon_args += ["-m", str(taxdump)]
         if db_prefix_value and '--restart' not in ganon_args:
-            if genomes_dir:
-                files_link = Path.cwd() / f"{db_prefix_value}_files"
-                if not files_link.exists():
-                    files_link.symlink_to(Path(genomes_dir).expanduser().resolve())
-                    logger.info(f"Linked {files_link} -> {genomes_dir}")
-            else:
-                link_genome_cache(cache_dir, db_prefix_value, ganon_args)
+            link_genome_cache(cache_dir, db_prefix_value, ganon_args)
         cmd = "ganon build " + " ".join(shlex.quote(arg) for arg in ganon_args)
         run_cmd(cmd)
         return
@@ -866,7 +912,7 @@ def build(
     if tool == 'kraken2':
         add_to_library(
             cache_dir, cwd, genomes_dir, db_type, db_name,
-            limit, batch_size, threads, use_k2
+            limit, from_idx, to_idx, batch_size, threads, use_k2
         )
         build_db(
             cache_dir, cwd, db_type, db_name, threads, kmer_len, min_len,
@@ -875,7 +921,7 @@ def build(
     elif tool == 'ganon2':
         build_ganon2(
             cache_dir, cwd, genomes_dir, db_type, db_name, threads,
-            kmer_len, min_len, level, rebuild
+            kmer_len, min_len, level, rebuild, from_idx, to_idx
         )
 
 
