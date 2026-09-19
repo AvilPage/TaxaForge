@@ -119,7 +119,14 @@ def download_file(url, position):
     if existing:
         request.add_header("Range", f"bytes={existing}-")
 
-    with urllib.request.urlopen(request) as response:
+    try:
+        response = urllib.request.urlopen(request)
+    except urllib.error.HTTPError as error:
+        if existing and error.code == 416:
+            return
+        raise
+
+    with response:
         resumed = response.status == 206
         total = int(response.headers.get("Content-Length", 0)) + (existing if resumed else 0)
 
@@ -366,6 +373,19 @@ exec "$REAL_BIN" "${{args[@]}}"
     return shim_dir
 
 
+INPUT_EXTENSION_CANDIDATES = ["fna.gz", "fna", "fa.gz", "fa", "fasta.gz", "fasta"]
+
+
+def detect_input_extension(input_dirs):
+    # ganon defaults to fna.gz; genomes-dir may hold uncompressed/differently-named files
+    for ext in INPUT_EXTENSION_CANDIDATES:
+        for input_dir in input_dirs:
+            path = Path(input_dir)
+            if path.is_dir() and next(path.rglob(f"*.{ext}"), None):
+                return ext
+    return INPUT_EXTENSION_CANDIDATES[0]
+
+
 def run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, min_len, level):
     taxa_flag = detect_taxonomy_flag()
     if taxa_flag == "--taxonomy-files":
@@ -375,9 +395,11 @@ def run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, mi
 
     assembly_summary_paths = ensure_assembly_summaries(cache_dir)
     genome_size_file = ensure_genome_size_file(cache_dir)
+    input_extension = detect_input_extension(input_dirs)
 
     cmd = (
         f"ganon build-custom --input {' '.join(input_dirs)} --input-recursive "
+        f"--input-extension {input_extension} "
         f"{tax_args} --taxonomy ncbi "
         f"--ncbi-file-info {' '.join(assembly_summary_paths)} "
         f"--genome-size-files {genome_size_file} "
@@ -739,7 +761,7 @@ def cli():
 @click.option('--seed-dir', 'seed_dirs', multiple=True, default=lambda: tuple(d for d in load_config().get(CONFIG_SECTION, 'seed-dirs', fallback='').split(',') if d), help='Existing folder(s) with genomes to reuse before downloading; missing ones still get downloaded (repeatable, config key: seed-dirs)')
 @click.option('--cache-dir', default=lambda: load_config().get(CONFIG_SECTION, 'cache-dir', fallback=str(create_cache_dir())), help='Cache directory for downloaded genomes/taxonomy (config key: cache-dir)')
 @click.option('--output-dir', default=lambda: load_config().get(CONFIG_SECTION, 'output-dir', fallback='.'), help='Directory to build the database in, instead of cwd (config key: output-dir)')
-@click.option('--threads', default=multiprocessing.cpu_count(), help='Number of threads to use', type=int)
+@click.option('--threads', default=max(1, int(multiprocessing.cpu_count() * 0.8)), help='Number of threads to use (default: 80% of CPU threads)', type=int)
 @click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated. Used only for kraken2')
 @click.option('--kmer-len', default=35, help='Kmer length in bp/aa. Used only in build task', type=int)
 @click.option('--min-len', default=31, help='Minimizer/window length in bp/aa. Used only in build task', type=int)
