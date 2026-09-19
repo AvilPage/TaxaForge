@@ -3,6 +3,7 @@ import concurrent.futures
 import configparser
 import datetime
 import hashlib
+import importlib.metadata
 import logging
 import multiprocessing
 import os
@@ -725,6 +726,7 @@ def infer_ganon_options(db_prefix):
 
 
 @click.group(no_args_is_help=True, epilog=f"Config file: {get_config_path()}")
+@click.version_option(importlib.metadata.version('taxaforge'), '--version', '-v')
 def cli():
     pass
 
