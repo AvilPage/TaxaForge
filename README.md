@@ -90,6 +90,22 @@ Nextflow's task cache; omit it for a fresh run. Set `NEXTFLOW_BIN`,
 pipeline, or revision. `--kmer-len`, `--min-len`, and `--level` are passed
 through only when specified.
 
+To turn a plain genome filename list into an [nf-core/createtaxdb](https://github.com/nf-core/createtaxdb) samplesheet (`id,taxid,fasta_dna`), use `createtaxdb-input`
+
+```bash
+taxaforge createtaxdb-input --input-file 250k_genomes.txt --genomes-dir /path/to/genomes --output samplesheet.csv
+```
+
+Add `--download-missing` to auto-fetch any listed genomes not found under `--genomes-dir`.
+
+By default `createtaxdb-input` auto-detects from the accessions in `--input-file` whether it needs NCBI's refseq and/or genbank `assembly_summary` file (genbank's is ~1.75GB, so it's skipped for refseq-only lists). Override with `--taxonomy-source refseq|genbank|both`.
+
+To build the samplesheet without downloading or even having any genomes locally, use `--remote` — it uses each accession's NCBI HTTPS URL (from `assembly_summary`'s `ftp_path`) as `fasta_dna`, since Nextflow/nf-core/createtaxdb can fetch those URLs itself
+
+```bash
+taxaforge createtaxdb-input --input-file 250k_genomes.txt --remote --output samplesheet.csv
+```
+
 Config
 ======
 

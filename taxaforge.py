@@ -989,11 +989,157 @@ def detect_assembly_summary_sections(input_dirs, input_extension):
             sections.add("refseq" if match.group(1) == "GCF" else "genbank")
     return sections if file_count else None
 
+ACCESSION_RE = re.compile(r"^(GC[AF]_\d+\.\d+)")
+RAPTOR_MAX_KMER = 32
+
+
+def build_accession_metadata_map(assembly_summary_paths):
+    # Same as build_accession_taxid_map but also keeps ftp_path (col 20), which points at
+    # the NCBI HTTPS/FTP directory for that assembly. nf-core/createtaxdb's fasta_dna column
+    # accepts remote URLs directly (Nextflow downloads them), so this lets us build a
+    # samplesheet in --remote mode without ever needing the genome files on local disk.
+    accession_to_info = {}
+    for path in assembly_summary_paths:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) > 19 and cols[0] and cols[5] and cols[19] and cols[19] != "na":
+                    accession_to_info[cols[0]] = (cols[5], cols[19])
+    return accession_to_info
+
+
+def ftp_path_to_fasta_url(ftp_path):
+    basename = ftp_path.rstrip("/").rsplit("/", 1)[-1]
+    return f"{ftp_path.rstrip('/')}/{basename}_genomic.fna.gz"
+
+
+def read_genome_name_list(input_file):
+    names = [
+        line.strip()
+        for line in Path(input_file).read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    logger.info(f"Read {len(names)} entries from --input-file list {input_file}")
+    return names
+
+
+def write_ganon_input_tsv(files, assembly_summary_paths):
+    # NOTE: --input-file does NOT auto-run --ncbi-file-info matching the way --input
+    # does - it requires the target/node (taxid) columns to be supplied manually, and
+    # silently invalidates every entry otherwise (ganon reports "Unable to match
+    # taxonomy to targets"). Passing thousands of files as bare --input args instead
+    # would work for small slices but blow past ARG_MAX for large ones (e.g. 600k
+    # genomes), so resolve accession -> taxid ourselves and write target/node into the
+    # tsv, same info --ncbi-file-info would have extracted.
+    accession_to_taxid = build_accession_taxid_map(assembly_summary_paths)
+    input_file_list = tempfile.NamedTemporaryFile(mode="w", prefix="ganon_input_", suffix=".tsv", delete=False)
+    matched, unmatched = 0, 0
+    for f in files:
+        match = ACCESSION_RE.match(Path(f).name)
+        accession = match.group(1) if match else None
+        taxid = accession_to_taxid.get(accession) if accession else None
+        if taxid:
+            matched += 1
+            input_file_list.write(f"{f}\t{accession}\t{taxid}\n")
+        else:
+            unmatched += 1
+            input_file_list.write(f"{f}\n")
+    input_file_list.close()
+    if unmatched:
+        logger.warning(f"{unmatched} of {len(files)} files had no accession/taxid match; they will be skipped by ganon")
+    else:
+        logger.info(f"Resolved taxid for all {matched} files")
+    return input_file_list.name
+
+
+def resolve_input_file_list(input_file, input_dirs, input_extension):
+    # input_file may list bare filenames (e.g. GCF_..._genomic.fna) with no directory
+    # component - resolve each against input_dirs so ganon gets real paths. Entries that
+    # are already absolute/relative paths pointing at existing files are used as-is.
+    names = read_genome_name_list(input_file)
+
+    index = {}
+    for input_dir in input_dirs:
+        for path in Path(input_dir).rglob(f"*.{input_extension}"):
+            index.setdefault(path.name, path)
+
+    resolved, missing = [], []
+    for name in names:
+        candidate = Path(name)
+        if candidate.is_file():
+            resolved.append(str(candidate))
+            continue
+        found = index.get(Path(name).name)
+        if found:
+            resolved.append(str(found))
+        else:
+            missing.append(name)
+    if missing:
+        logger.warning(f"{len(missing)} of {len(names)} entries in {input_file} not found under {input_dirs}")
+    logger.info(f"Resolved {len(resolved)} genome files from {input_file}")
+    return resolved, missing
+
+
+def download_missing_genomes(missing_names, genomes_dir, threads):
+    # Missing entries are grouped by accession prefix - GCF_ lives under NCBI's refseq
+    # section, GCA_ only under genbank - and downloaded straight into genomes_dir so the
+    # caller's directory rglob picks them up on re-resolve without any extra copy/move step.
+    accessions_by_section = {"refseq": [], "genbank": []}
+    unmatched = 0
+    for name in missing_names:
+        match = ACCESSION_RE.match(Path(name).name)
+        if not match:
+            unmatched += 1
+            continue
+        accession = match.group(1)
+        section = "refseq" if accession.startswith("GCF_") else "genbank"
+        accessions_by_section[section].append(accession)
+
+    if unmatched:
+        logger.warning(f"{unmatched} missing entries have no recognizable GCA_/GCF_ accession; cannot auto-download them")
+
+    genomes_dir = Path(genomes_dir)
+    genomes_dir.mkdir(parents=True, exist_ok=True)
+    for section, accessions in accessions_by_section.items():
+        if not accessions:
+            continue
+        logger.info(f"Downloading {len(accessions)} missing genomes from NCBI {section}")
+        result = ncbi_genome_download.download(
+            section=section, groups="all", file_formats="fasta",
+            assembly_accessions=accessions,
+            progress_bar=True, parallel=threads,
+            output=str(genomes_dir), uri=f"{NCBI_SERVER}/genomes"
+        )
+        if result not in (0, 1):
+            raise click.ClickException(
+                f"NCBI genome download failed for {section} (exit code {result})"
+            )
+    decompress_gzip_files(genomes_dir, threads)
 
 def run_ganon_build_custom(
     cache_dir, input_dirs, db_name, threads, kmer_len, min_len, level,
     from_idx=None, to_idx=None, restart=False, custom_args=None,
+    input_file=None, download_missing=False, download_threads=None,
 ):
+    if kmer_len is not None and int(kmer_len) > RAPTOR_MAX_KMER:
+        logger.warning(
+            f"--kmer-len {kmer_len} exceeds raptor's max of {RAPTOR_MAX_KMER} "
+            f"for ganon2 builds; clamping to {RAPTOR_MAX_KMER}"
+        )
+        kmer_len = RAPTOR_MAX_KMER
+    if (
+        kmer_len is not None
+        and min_len is not None
+        and int(min_len) < int(kmer_len)
+    ):
+        logger.warning(
+            f"--min-len {min_len} is smaller than --kmer-len {kmer_len}; "
+            f"raising --min-len to {kmer_len}"
+        )
+        min_len = kmer_len
+
     taxa_flag = detect_taxonomy_flag()
     if taxa_flag == "--taxonomy-files":
         tax_args = f"{taxa_flag} {cache_dir}/taxonomy/nodes.dmp {cache_dir}/taxonomy/names.dmp"
@@ -1011,25 +1157,42 @@ def run_ganon_build_custom(
     window_args = f" --window-size {min_len}" if min_len is not None else ""
     custom_args_str = " ".join(shlex.quote(arg) for arg in (custom_args or []))
 
-    input_file_list = None
-    if from_idx is not None or to_idx is not None:
+    input_file_list_path = None
+    ncbi_file_info_args = f"--ncbi-file-info {' '.join(assembly_summary_paths)} "
+    if input_file is not None:
+        files, missing = resolve_input_file_list(input_file, input_dirs, input_extension)
+        if missing and download_missing:
+            download_missing_genomes(
+                missing, input_dirs[0], download_threads or threads
+            )
+            files, missing = resolve_input_file_list(input_file, input_dirs, input_extension)
+            if missing:
+                logger.warning(f"{len(missing)} entries still missing after download attempt; they will be skipped")
+        input_file_list_path = write_ganon_input_tsv(files, assembly_summary_paths)
+        input_args = f"--input-file {shlex.quote(input_file_list_path)}"
+        # target/node already supplied per-row above; --ncbi-file-info would be ignored
+        # (and only slows things down re-parsing assembly summaries) for matched rows.
+        ncbi_file_info_args = ""
+    elif from_idx is not None or to_idx is not None:
         files = sorted(
             str(path) for input_dir in input_dirs
             for path in Path(input_dir).rglob(f"*.{input_extension}")
         )
         logger.info(f"Using genome files range [{from_idx}:{to_idx}] out of {len(files)}")
         files = files[from_idx:to_idx]
-        input_file_list = tempfile.NamedTemporaryFile(mode="w", prefix="ganon_input_", suffix=".tsv", delete=False)
-        input_file_list.write("\n".join(files) + "\n")
-        input_file_list.close()
-        input_args = f"--input-file {shlex.quote(input_file_list.name)}"
+
+        input_file_list_path = write_ganon_input_tsv(files, assembly_summary_paths)
+        input_args = f"--input-file {shlex.quote(input_file_list_path)}"
+        # target/node already supplied per-row above; --ncbi-file-info would be ignored
+        # (and only slows things down re-parsing assembly summaries) for matched rows.
+        ncbi_file_info_args = ""
     else:
         input_args = f"--input {' '.join(input_dirs)} --input-recursive --input-extension {input_extension}"
 
     cmd = (
         f"ganon build-custom {input_args} "
         f"{tax_args} --taxonomy ncbi "
-        f"--ncbi-file-info {' '.join(assembly_summary_paths)} "
+        f"{ncbi_file_info_args}"
         f"--genome-size-files {genome_size_file} "
         f"--db-prefix {db_name} --threads {threads}"
         f"{kmer_args}{window_args}{level_args}"
@@ -1045,8 +1208,8 @@ def run_ganon_build_custom(
             run_cmd(cmd)
         finally:
             os.environ["PATH"] = old_path
-            if input_file_list:
-                os.unlink(input_file_list.name)
+            if input_file_list_path:
+                os.unlink(input_file_list_path)
 
     cmd = f"du -sh {db_name}.*"
     run_cmd(cmd)
@@ -1055,6 +1218,7 @@ def run_ganon_build_custom(
 def build_ganon2(
     cache_dir, cwd, genomes_dir, db_type, db_name, threads, kmer_len, min_len,
     level, rebuild, from_idx=None, to_idx=None, custom_args=None,
+    input_file=None, download_missing=False, download_threads=None,
 ):
     os.chdir(cwd)
 
@@ -1072,6 +1236,8 @@ def build_ganon2(
     run_ganon_build_custom(
         cache_dir, input_dirs, db_name, threads, kmer_len, min_len, level,
         from_idx, to_idx, restart=rebuild, custom_args=custom_args,
+        input_file=input_file, download_missing=download_missing,
+        download_threads=download_threads,
     )
 
 
@@ -1437,6 +1603,8 @@ def cli():
 @click.option('--createtaxdb-pipeline', default=lambda: os.environ.get('CREATETAXDB_PIPELINE', 'nf-core/createtaxdb'), help='Nextflow pipeline name or path.')
 @click.option('--pipeline-revision', default=lambda: os.environ.get('CREATETAXDB_REVISION'), help='Optional nf-core/createtaxdb pipeline revision.')
 @click.option('--resume', is_flag=True, help='Resume a previous Nextflow run (createtaxdb backend only).')
+@click.option('--input-file', default=None, help='Path to a text file listing genome filenames (one per line, matched against --genomes-dir) to build a ganon/ganon2 index from a specific subset, bypassing full directory scan')
+@click.option('--download-missing', is_flag=True, help='With --input-file: auto-download any listed genomes missing from --genomes-dir via ncbi-genome-download (matched by GCA_/GCF_ accession in filename), then retry the build')
 @click.option('--seed-dir', 'seed_dirs', multiple=True, default=lambda: tuple(d for d in load_config().get(CONFIG_SECTION, 'seed-dirs', fallback='').split(',') if d), help='Existing folder(s) with genomes to reuse before downloading; missing ones still get downloaded (repeatable, config key: seed-dirs)')
 @click.option('--cache-dir', default=lambda: load_config().get(CONFIG_SECTION, 'cache-dir', fallback=str(create_cache_dir())), help='Cache directory for downloaded genomes/taxonomy (config key: cache-dir)')
 @click.option('--output-dir', default=lambda: load_config().get(CONFIG_SECTION, 'output-dir', fallback='.'), help='Directory to build the database in, instead of cwd (config key: output-dir)')
@@ -1463,6 +1631,7 @@ def build(
         tool: str, backend, db_type: str, db_name, cache_dir, output_dir, genomes_dir, genomes_cache_dir, assembly_accessions_file,
         nextflow_bin, createtaxdb_pipeline, pipeline_revision, resume, seed_dirs,
         threads, download_threads, build_threads, load_factor, kmer_len: int, min_len, level: str, limit: int, from_idx: int, to_idx: int, batch_size: int,
+        input_file, download_missing,
         force: bool, rebuild, fast_build: bool, use_k2: bool, download_only: bool, ganon_args
 ):
     if backend == "createtaxdb" and tool != "ganon2":
@@ -1491,6 +1660,14 @@ def build(
         raise click.UsageError("--assembly-accessions-file cannot be combined with --genomes-dir")
     if assembly_accessions_file and tool != "ganon2":
         raise click.UsageError("--assembly-accessions-file is currently supported only with --tool ganon2")
+    if input_file and not genomes_dir:
+        raise click.UsageError("--input-file requires --genomes-dir")
+    if download_missing and not input_file:
+        raise click.UsageError("--download-missing requires --input-file")
+    if input_file and tool not in ("ganon", "ganon2"):
+        raise click.UsageError("--input-file is supported only with --tool ganon or --tool ganon2")
+    if input_file and backend != "direct":
+        raise click.UsageError("--input-file cannot be used with --backend createtaxdb")
     if assembly_accessions_file:
         try:
             read_assembly_accessions(assembly_accessions_file, limit)
@@ -1508,6 +1685,11 @@ def build(
     output_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(output_dir)
     logger.info(f"Building in {output_dir}")
+
+    if kmer_len is None:
+        # ganon's own default k-mer size is 19; kraken2-build's is 35. Use whichever
+        # matches the selected tool instead of forcing one default on both.
+        kmer_len = 19 if tool in ('ganon', 'ganon2') else 35
 
     if tool in ('ganon', 'ganon2') and ganon_args and not assembly_accessions_file:
         logger.info(f"Passing through unrecognized options to native ganon build: {' '.join(ganon_args)}")
@@ -1533,6 +1715,8 @@ def build(
                 cache_dir, [str(genomes_dir)], db_prefix_value, threads,
                 kmer_len, min_len, level, from_idx, to_idx,
                 custom_args=list(ganon_args),
+                input_file=input_file, download_missing=download_missing,
+                download_threads=download_threads,
             )
             return
 
@@ -1641,6 +1825,8 @@ def build(
                 cache_dir, cwd, genomes_dir, db_type, db_name, threads,
                 kmer_len, min_len, level, rebuild, from_idx, to_idx,
                 custom_args=list(ganon_args) or None,
+                input_file=input_file, download_missing=download_missing,
+                download_threads=download_threads,
             )
 
 
@@ -1678,6 +1864,81 @@ def config_set(key, value):
     parser.set(CONFIG_SECTION, key, value)
     save_config(parser)
     logger.info(f"Set {key} = {value}")
+
+
+@cli.command(name='createtaxdb-input')
+@click.option('--input-file', required=True, help='Path to a text file listing genome filenames/accessions (one per line) to include in the samplesheet')
+@click.option('--genomes-dir', default=None, help='Directory containing the genome fasta files to resolve --input-file entries against. Not required with --remote')
+@click.option('--output', default='samplesheet.csv', help='Path to write the nf-core/createtaxdb samplesheet CSV to (default: samplesheet.csv)')
+@click.option('--remote', is_flag=True, help="Don't require genomes on local disk: use each accession's NCBI HTTPS ftp_path (from assembly_summary) as fasta_dna instead, since nf-core/createtaxdb/Nextflow can download those URLs itself. Skips --genomes-dir and --download-missing entirely")
+@click.option('--download-missing', is_flag=True, help='With local (non --remote) mode: auto-download any listed genomes missing from --genomes-dir via ncbi-genome-download (matched by GCA_/GCF_ accession in filename), then retry resolution')
+@click.option('--taxonomy-source', type=click.Choice(['auto', 'refseq', 'genbank', 'both']), default='auto', help='Which NCBI assembly_summary file(s) to download for accession->taxid/ftp_path lookup. "auto" (default) inspects --input-file and only fetches genbank\'s (~1.75GB) if GCA_ accessions are present, skipping it for refseq-only (GCF_) lists')
+@click.option('--cache-dir', default=lambda: load_config().get(CONFIG_SECTION, 'cache-dir', fallback=str(create_cache_dir())), help='Cache directory for downloaded genomes/taxonomy (config key: cache-dir)')
+@click.option('--threads', default=max(1, min(MAX_DOWNLOAD_THREADS, int(multiprocessing.cpu_count() * 0.8))), help=f'Number of download workers for --download-missing (maximum {MAX_DOWNLOAD_THREADS})', type=click.IntRange(min=1, max=MAX_DOWNLOAD_THREADS))
+def createtaxdb_input(input_file, genomes_dir, output, remote, download_missing, taxonomy_source, cache_dir, threads):
+    """Turn a plain genome filename list into an nf-core/createtaxdb samplesheet (id,taxid,fasta_dna)."""
+    if not remote and not genomes_dir:
+        logger.error("--genomes-dir is required unless --remote is set")
+        sys.exit(1)
+
+    if remote:
+        names = read_genome_name_list(input_file)
+        missing = []
+    else:
+        input_dirs = [genomes_dir]
+        input_extension = detect_input_extension(input_dirs)
+        files, missing = resolve_input_file_list(input_file, input_dirs, input_extension)
+        if missing and download_missing:
+            download_missing_genomes(missing, genomes_dir, threads)
+            files, missing = resolve_input_file_list(input_file, input_dirs, input_extension)
+
+    scan_names = names if remote else [Path(f).name for f in files] + missing
+    if taxonomy_source == 'auto':
+        sections = tuple(sorted({
+            "refseq" if name.startswith("GCF_") else "genbank"
+            for name in scan_names if ACCESSION_RE.match(name)
+        })) or ("refseq", "genbank")
+    elif taxonomy_source == 'both':
+        sections = ("refseq", "genbank")
+    else:
+        sections = (taxonomy_source,)
+    logger.info(f"Fetching assembly_summary for section(s): {', '.join(sections)}")
+    assembly_summary_paths = ensure_assembly_summaries(cache_dir, sections=sections)
+
+    rows, unmatched = [], 0
+    if remote:
+        accession_to_info = build_accession_metadata_map(assembly_summary_paths)
+        for name in names:
+            match = ACCESSION_RE.match(Path(name).name)
+            accession = match.group(1) if match else None
+            info = accession_to_info.get(accession) if accession else None
+            if info:
+                taxid, ftp_path = info
+                rows.append((accession, taxid, ftp_path_to_fasta_url(ftp_path)))
+            else:
+                unmatched += 1
+    else:
+        accession_to_taxid = build_accession_taxid_map(assembly_summary_paths)
+        for f in files:
+            match = ACCESSION_RE.match(Path(f).name)
+            accession = match.group(1) if match else None
+            taxid = accession_to_taxid.get(accession) if accession else None
+            if taxid:
+                rows.append((accession, taxid, str(Path(f).resolve())))
+            else:
+                unmatched += 1
+
+    with open(output, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["id", "taxid", "fasta_dna"])
+        writer.writerows(rows)
+
+    total = len(names) if remote else len(files)
+    if unmatched:
+        logger.warning(f"{unmatched} of {total} entries had no accession/taxid match; they were skipped")
+    if missing and not remote and not download_missing:
+        logger.warning(f"{len(missing)} entries from {input_file} could not be found under {genomes_dir}; re-run with --download-missing to fetch them locally, or use --remote to reference NCBI URLs instead")
+    logger.info(f"Wrote {len(rows)} entries to {output}")
 
 
 DOCTOR_BINS = ["ncbi-genome-download", "kraken2-build", "k2", "ganon", "any2fasta", "wget", "tar", "gunzip"]
