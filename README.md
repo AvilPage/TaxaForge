@@ -45,13 +45,50 @@ taxaforge build --db-name k2_test_100 --genomes-dir /path/to/genomes --limit 100
 To download and build only the assemblies in an accession list with ganon, use
 `--assembly-accessions-file`. The file may contain assembly accessions or FASTA
 filenames containing one accession per line; `--limit` selects the first
-distinct accessions before download.
+distinct accessions. Use `--genomes-cache-dir` to reuse matching FASTA files
+already present in a directory tree; only requested assemblies missing from
+that cache are downloaded. For ganon2 builds, omitted `--kmer-len`, `--min-len`,
+and `--level` options are left unset so ganon applies its own defaults.
+Additional ganon `build-custom` options can be passed through, for example
+`--max-fp 0.01`.
+
+Use `--download-threads` and `--build-threads` to tune download parallelism
+separately from index building. Downloads default to at most 4 workers, and
+`--download-threads` accepts values from 1 to 4. For example, reduce NCBI
+request concurrency while keeping the index build parallel:
+
+```bash
+taxaforge build --db-type archaea --download-threads 2 --build-threads 12
+```
+
+The legacy `--threads` option remains available and sets both values unless
+overridden by a specific option; its download value is capped at 4. Build
+threads default to 80% of available CPU threads.
 
 ```bash
 taxaforge build --tool ganon2 \
   --assembly-accessions-file /path/to/250k_genomes.txt \
-  --limit 1000 --db-name g1000 --threads 4
+  --genomes-cache-dir /path/to/existing/genomes \
+  --limit 1000 --db-name g1000 --threads 4 --max-fp 0.01
 ```
+
+For a workflow-managed build with nf-core/createtaxdb, install Nextflow, Java
+17+, and Docker, then select the `createtaxdb` backend:
+
+```bash
+taxaforge build --tool ganon2 --backend createtaxdb \
+  --assembly-accessions-file /path/to/250k_genomes.txt \
+  --genomes-cache-dir /path/to/existing/genomes \
+  --limit 1000 --db-name g1000 --threads 4 --resume
+```
+
+This creates a complete samplesheet from the requested FASTA files and NCBI
+assembly summaries, then invokes nf-core/createtaxdb with Docker. Missing FASTA
+files or taxids are errors rather than silently omitted rows. `--resume` uses
+Nextflow's task cache; omit it for a fresh run. Set `NEXTFLOW_BIN`,
+`CREATETAXDB_PIPELINE`, and `CREATETAXDB_REVISION` to override the executable,
+pipeline, or revision. `--kmer-len`, `--min-len`, and `--level` are passed
+through only when specified.
 
 Config
 ======
