@@ -178,7 +178,12 @@ def download_taxanomy(cache_dir, skip_maps=None, protein=None):
     download_files(urls)
 
     logger.info("Extracting taxdump.tar.gz")
-    cmd = f"tar -k -xvf taxdump.tar.gz"
+    # NCBI's taxdump.tar.gz has trailing garbage after the gzip stream, which gzip
+    # warns about (exit status 2) even though decompression is fine. GNU tar spawns
+    # gzip internally and treats that nonzero exit as fatal ("Child returned status 2"),
+    # aborting despite already extracting everything. Decompress via a separate pipe so
+    # only tar's own exit status (from the last command in the pipe) is checked.
+    cmd = f"gzip -dc taxdump.tar.gz | tar -xf -"
     run_cmd(cmd)
 
     logger.info("Decompressing taxonomy data")
