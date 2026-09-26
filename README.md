@@ -42,6 +42,17 @@ To limit the number of genomes in the database, use the `--limit` option
 taxaforge build --db-name k2_test_100 --genomes-dir /path/to/genomes --limit 1000
 ```
 
+To download and build only the assemblies in an accession list with ganon, use
+`--assembly-accessions-file`. The file may contain assembly accessions or FASTA
+filenames containing one accession per line; `--limit` selects the first
+distinct accessions before download.
+
+```bash
+taxaforge build --tool ganon2 \
+  --assembly-accessions-file /path/to/250k_genomes.txt \
+  --limit 1000 --db-name g1000 --threads 4
+```
+
 Config
 ======
 

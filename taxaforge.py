@@ -155,37 +155,41 @@ def download_files(urls, max_workers=4):
 def download_taxanomy(cache_dir, skip_maps=None, protein=None):
     taxonomy_path = os.path.join(cache_dir, "taxonomy")
     os.makedirs(taxonomy_path, exist_ok=True)
+    original_cwd = os.getcwd()
     os.chdir(taxonomy_path)
 
-    urls = []
-    if not skip_maps:
-        if not protein:
-            # Define URLs for nucleotide accession to taxon map
-            urls = [
-                f"{NCBI_SERVER}/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz",
-                f"{NCBI_SERVER}/pub/taxonomy/accession2taxid/nucl_wgs.accession2taxid.gz"
-            ]
+    try:
+        urls = []
+        if not skip_maps:
+            if not protein:
+                # Define URLs for nucleotide accession to taxon map
+                urls = [
+                    f"{NCBI_SERVER}/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz",
+                    f"{NCBI_SERVER}/pub/taxonomy/accession2taxid/nucl_wgs.accession2taxid.gz"
+                ]
+            else:
+                # Define URL for protein accession to taxon map
+                urls = ["ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/prot.accession2taxid.gz"]
         else:
-            # Define URL for protein accession to taxon map
-            urls = ["ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/prot.accession2taxid.gz"]
-    else:
-        logger.info("Skipping maps download")
+            logger.info("Skipping maps download")
 
-    # Download taxonomy tree data
-    urls.append(f"{NCBI_SERVER}/pub/taxonomy/taxdump.tar.gz")
+        # Download taxonomy tree data
+        urls.append(f"{NCBI_SERVER}/pub/taxonomy/taxdump.tar.gz")
 
-    logger.info(f"Downloading {len(urls)} taxonomy files")
-    download_files(urls)
+        logger.info(f"Downloading {len(urls)} taxonomy files")
+        download_files(urls)
 
-    logger.info("Extracting taxdump.tar.gz")
-    cmd = f"tar -k -xvf taxdump.tar.gz"
-    run_cmd(cmd)
+        logger.info("Extracting taxdump.tar.gz")
+        cmd = f"tar -k -xvf taxdump.tar.gz"
+        run_cmd(cmd)
 
-    logger.info("Decompressing taxonomy data")
-    cmd = f"find {cache_dir}/taxonomy -name '*.gz' | xargs -n 1 gunzip -k"
-    run_cmd(cmd)
+        logger.info("Decompressing taxonomy data")
+        cmd = f"find {cache_dir}/taxonomy -name '*.gz' | xargs -n 1 gunzip -k"
+        run_cmd(cmd)
 
-    logger.info("Finished downloading taxonomy data")
+        logger.info("Finished downloading taxonomy data")
+    finally:
+        os.chdir(original_cwd)
 
 
 def run_cmd(cmd, return_output=False, no_output=False):
@@ -253,6 +257,158 @@ def ensure_organism_genomes(cache_dir, organism, threads, seed_dirs=None):
     logger.info(f"Finished downloading {organism} genomes")
 
 
+def read_assembly_accessions(accession_file, limit=None):
+    """Read exact NCBI assembly accessions, also accepting FASTA filenames."""
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be a positive integer")
+
+    accession_pattern = re.compile(r'GC[AF]_\d+\.\d+')
+    accessions = []
+    seen = set()
+    with open(accession_file, encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            matches = accession_pattern.findall(line)
+            accession = next((match for match in matches if line.startswith(match)), None)
+            if accession is None and len(matches) == 1:
+                accession = matches[0]
+            if accession is None:
+                raise ValueError(
+                    f"Expected one NCBI assembly accession on line {line_number} "
+                    f"of {accession_file}"
+                )
+            if accession not in seen:
+                accessions.append(accession)
+                seen.add(accession)
+                if limit is not None and len(accessions) >= limit:
+                    break
+
+    if not accessions:
+        raise ValueError(f"No NCBI assembly accessions found in {accession_file}")
+    return accessions
+
+
+def download_assembly_accessions(cache_dir, accession_file, threads, limit=None):
+    """Download only the assemblies listed in an accession/FASTA list."""
+    accessions = read_assembly_accessions(accession_file, limit)
+    digest = hashlib.sha256("\n".join(accessions).encode("utf-8")).hexdigest()[:16]
+    genome_dir = Path(cache_dir) / "genomes" / f"accessions-{digest}"
+    genome_dir.mkdir(parents=True, exist_ok=True)
+
+    for section, prefix in (("refseq", "GCF_"), ("genbank", "GCA_")):
+        section_accessions = [
+            accession for accession in accessions if accession.startswith(prefix)
+        ]
+        if not section_accessions:
+            continue
+
+        logger.info(
+            f"Downloading {len(section_accessions)} selected {section} assemblies"
+        )
+        result = ncbi_genome_download.download(
+            section=section,
+            groups="all",
+            assembly_accessions=section_accessions,
+            file_formats="fasta",
+            assembly_levels="all",
+            flat_output=True,
+            progress_bar=True,
+            parallel=threads,
+            output=str(genome_dir),
+            uri=f"{NCBI_SERVER}/genomes",
+        )
+        if result not in (0, 1):
+            raise RuntimeError(
+                f"NCBI genome download failed for {section} accessions "
+                f"(exit code {result})"
+            )
+        if result == 1:
+            logger.info(
+                f"No current {section} assemblies matched; checking NCBI summaries"
+            )
+
+    downloaded = {
+        match.group(1)
+        for genome_path in genome_dir.glob("*_genomic.fna.gz")
+        if (match := re.search(r"(GC[AF]_\d+\.\d+)", genome_path.name))
+    }
+    missing = [accession for accession in accessions if accession not in downloaded]
+    if missing:
+        summary_sections = {
+            "refseq" if accession.startswith("GCF_") else "genbank"
+            for accession in missing
+        }
+        summaries = ensure_assembly_summaries(cache_dir, summary_sections)
+        summary_columns = None
+        ftp_paths = {}
+        missing_set = set(missing)
+        for summary_path in summaries:
+            with open(summary_path, encoding="utf-8") as summary:
+                for line in summary:
+                    if line.startswith("#assembly_accession") or line.startswith(
+                        "# assembly_accession"
+                    ):
+                        summary_columns = line.lstrip("#").strip().split("\t")
+                        accession_column = summary_columns.index("assembly_accession")
+                        ftp_column = summary_columns.index("ftp_path")
+                        continue
+                    if line.startswith("#") or not line.strip() or summary_columns is None:
+                        continue
+                    columns = line.rstrip("\n").split("\t")
+                    accession = columns[accession_column]
+                    if accession in missing_set:
+                        ftp_path = columns[ftp_column]
+                        if ftp_path != "na":
+                            ftp_paths[accession] = ftp_path
+
+        fallback_urls = []
+        for accession in missing:
+            ftp_path = ftp_paths.get(accession)
+            if not ftp_path:
+                continue
+            ftp_path = ftp_path.replace(
+                "ftp://ftp.ncbi.nlm.nih.gov",
+                "https://ftp.ncbi.nlm.nih.gov",
+            )
+            assembly_dir = ftp_path.rstrip("/").rsplit("/", 1)[-1]
+            fallback_urls.append(
+                f"{ftp_path}/{assembly_dir}_genomic.fna.gz"
+            )
+
+        if fallback_urls:
+            logger.info(
+                f"Downloading {len(fallback_urls)} selected historical assemblies "
+                "from NCBI assembly summaries"
+            )
+            original_cwd = os.getcwd()
+            os.chdir(genome_dir)
+            try:
+                download_files(fallback_urls, max_workers=threads)
+            finally:
+                os.chdir(original_cwd)
+
+        downloaded = {
+            match.group(1)
+            for genome_path in genome_dir.glob("*_genomic.fna.gz")
+            if (match := re.search(r"(GC[AF]_\d+\.\d+)", genome_path.name))
+        }
+        missing = [accession for accession in accessions if accession not in downloaded]
+
+    if missing:
+        preview = ", ".join(missing[:10])
+        remaining = len(missing) - min(len(missing), 10)
+        suffix = f" (and {remaining} more)" if remaining else ""
+        raise RuntimeError(
+            f"NCBI did not provide {len(missing)} requested assemblies: "
+            f"{preview}{suffix}"
+        )
+
+    logger.info(f"Downloaded all {len(accessions)} requested assemblies to {genome_dir}")
+    return str(genome_dir)
+
+
 def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False, seed_dirs=None):
     organisms = DB_TYPE_CONFIG.get(db_type, [db_type])
     if force:
@@ -314,24 +470,38 @@ def detect_taxonomy_flag():
     return "--taxonomy-files"
 
 
-def ensure_assembly_summaries(cache_dir):
+def ensure_assembly_summaries(cache_dir, sections=None):
     # Cached so `ganon build-custom --ncbi-file-info` doesn't re-download these on every build
     taxonomy_path = os.path.join(cache_dir, "taxonomy")
     os.makedirs(taxonomy_path, exist_ok=True)
 
-    urls = [
-        f"{NCBI_SERVER}/genomes/refseq/assembly_summary_refseq.txt",
-        f"{NCBI_SERVER}/genomes/genbank/assembly_summary_genbank.txt",
-        f"{NCBI_SERVER}/genomes/refseq/assembly_summary_refseq_historical.txt",
-        f"{NCBI_SERVER}/genomes/genbank/assembly_summary_genbank_historical.txt",
-    ]
+    summary_urls = {
+        "refseq": [
+            f"{NCBI_SERVER}/genomes/refseq/assembly_summary_refseq.txt",
+            f"{NCBI_SERVER}/genomes/refseq/assembly_summary_refseq_historical.txt",
+        ],
+        "genbank": [
+            f"{NCBI_SERVER}/genomes/genbank/assembly_summary_genbank.txt",
+            f"{NCBI_SERVER}/genomes/genbank/assembly_summary_genbank_historical.txt",
+        ],
+    }
+    sections = set(summary_urls) if sections is None else set(sections)
+    unknown_sections = sections - summary_urls.keys()
+    if unknown_sections:
+        raise ValueError(f"Unsupported NCBI assembly summary section(s): {unknown_sections}")
+
+    urls = [url for section in ("refseq", "genbank") if section in sections for url in summary_urls[section]]
     paths = [os.path.join(taxonomy_path, url.rsplit("/", 1)[-1]) for url in urls]
     missing_urls = [url for url, path in zip(urls, paths) if not os.path.exists(path)]
 
     if missing_urls:
         logger.info(f"Downloading {len(missing_urls)} assembly summary files")
+        original_cwd = os.getcwd()
         os.chdir(taxonomy_path)
-        download_files(missing_urls)
+        try:
+            download_files(missing_urls)
+        finally:
+            os.chdir(original_cwd)
 
     return paths
 
@@ -345,8 +515,12 @@ def ensure_genome_size_file(cache_dir):
     path = os.path.join(taxonomy_path, "species_genome_size.txt.gz")
     if not os.path.exists(path):
         logger.info("Downloading species genome size file")
+        original_cwd = os.getcwd()
         os.chdir(taxonomy_path)
-        download_files([f"{NCBI_SERVER}/genomes/ASSEMBLY_REPORTS/species_genome_size.txt.gz"])
+        try:
+            download_files([f"{NCBI_SERVER}/genomes/ASSEMBLY_REPORTS/species_genome_size.txt.gz"])
+        finally:
+            os.chdir(original_cwd)
 
     return path
 
@@ -401,6 +575,19 @@ def detect_input_extension(input_dirs):
     return best_ext if counts[best_ext] else INPUT_EXTENSION_CANDIDATES[0]
 
 
+def detect_assembly_summary_sections(input_dirs, input_extension):
+    sections = set()
+    file_count = 0
+    for input_dir in input_dirs:
+        for path in Path(input_dir).rglob(f"*.{input_extension}"):
+            file_count += 1
+            match = re.match(r"(GCF|GCA)_\d+\.\d+", path.name)
+            if not match:
+                return None
+            sections.add("refseq" if match.group(1) == "GCF" else "genbank")
+    return sections if file_count else None
+
+
 def run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, min_len, level, from_idx=None, to_idx=None):
     taxa_flag = detect_taxonomy_flag()
     if taxa_flag == "--taxonomy-files":
@@ -408,9 +595,10 @@ def run_ganon_build_custom(cache_dir, input_dirs, db_name, threads, kmer_len, mi
     else:
         tax_args = f"{taxa_flag} {cache_dir}/taxonomy/taxdump.tar.gz"
 
-    assembly_summary_paths = ensure_assembly_summaries(cache_dir)
-    genome_size_file = ensure_genome_size_file(cache_dir)
     input_extension = detect_input_extension(input_dirs)
+    summary_sections = detect_assembly_summary_sections(input_dirs, input_extension)
+    assembly_summary_paths = ensure_assembly_summaries(cache_dir, summary_sections)
+    genome_size_file = ensure_genome_size_file(cache_dir)
 
     # ganon has no 'file' taxonomic rank - 'file' means per-file bins, achieved by
     # omitting --level so it defaults to --input-target (itself defaulting to 'file').
@@ -797,6 +985,7 @@ def cli():
 @click.option('--db-type', default=None, help='database type to build')
 @click.option('--db-name', default=None, help='database name to build')
 @click.option('--genomes-dir', default=None, help='Directory containing genomes')
+@click.option('--assembly-accessions-file', type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path), default=None, help='Download only NCBI assemblies listed in this file (accessions or FASTA filenames, one per line). Used only for ganon2')
 @click.option('--seed-dir', 'seed_dirs', multiple=True, default=lambda: tuple(d for d in load_config().get(CONFIG_SECTION, 'seed-dirs', fallback='').split(',') if d), help='Existing folder(s) with genomes to reuse before downloading; missing ones still get downloaded (repeatable, config key: seed-dirs)')
 @click.option('--cache-dir', default=lambda: load_config().get(CONFIG_SECTION, 'cache-dir', fallback=str(create_cache_dir())), help='Cache directory for downloaded genomes/taxonomy (config key: cache-dir)')
 @click.option('--output-dir', default=lambda: load_config().get(CONFIG_SECTION, 'output-dir', fallback='.'), help='Directory to build the database in, instead of cwd (config key: output-dir)')
@@ -818,10 +1007,20 @@ def cli():
 @click.pass_context
 def build(
         context,
-        tool: str, db_type: str, db_name, cache_dir, output_dir, genomes_dir, seed_dirs,
+        tool: str, db_type: str, db_name, cache_dir, output_dir, genomes_dir, assembly_accessions_file, seed_dirs,
         threads, load_factor, kmer_len: int, min_len, level: str, limit: int, from_idx: int, to_idx: int, batch_size: int,
         force: bool, rebuild, fast_build: bool, use_k2: bool, download_only: bool, ganon_args
 ):
+    if assembly_accessions_file and genomes_dir:
+        raise click.UsageError("--assembly-accessions-file cannot be combined with --genomes-dir")
+    if assembly_accessions_file and tool != "ganon2":
+        raise click.UsageError("--assembly-accessions-file is currently supported only with --tool ganon2")
+    if assembly_accessions_file:
+        try:
+            read_assembly_accessions(assembly_accessions_file, limit)
+        except ValueError as error:
+            raise click.BadParameter(str(error), param_hint="--assembly-accessions-file") from error
+
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(output_dir)
@@ -902,7 +1101,16 @@ def build(
 
     download_taxanomy(cache_dir, skip_maps=(tool == 'ganon2'))
 
-    if not genomes_dir:
+    if assembly_accessions_file:
+        try:
+            genomes_dir = download_assembly_accessions(
+                cache_dir, assembly_accessions_file, threads, limit
+            )
+        except ValueError as error:
+            raise click.BadParameter(str(error), param_hint="--assembly-accessions-file") from error
+        except RuntimeError as error:
+            raise click.ClickException(str(error)) from error
+    elif not genomes_dir:
         download_genomes(cache_dir, cwd, db_type, db_name, threads, force, seed_dirs)
 
     if download_only:
