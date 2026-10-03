@@ -65,6 +65,26 @@ The legacy `--threads` option remains available and sets both values unless
 overridden by a specific option; its download value is capped at 4. Build
 threads default to 80% of available CPU threads.
 
+For Kraken2, `--minimizer-len` is an alias for `--min-len` and is passed as
+`kraken2-build --minimizer-len`. The minimizer length cannot exceed the k-mer
+length; if omitted and a shorter `--kmer-len` is selected, TaxaForge lowers
+the default minimizer length to match. Kraken2's default 7 minimizer spaces
+also cannot exceed one quarter of the minimizer length. TaxaForge lowers that
+default when needed (for example, a minimizer length of 26 uses 6 spaces).
+Override it with `--minimizer-spaces`; values above Kraken2's limit are rejected
+before genome downloads begin.
+
+Use `--max-db-size` to impose a Kraken2 hash-table budget. Kraken2 downsamples
+minimizers to fit the budget, trading sensitivity for a bounded index size:
+
+```bash
+taxaforge build --tool kraken2 --db-type bacteria --db-name bacteria-50g \
+  --max-db-size 50G
+```
+
+The value must be a positive byte count, optionally suffixed with `K`, `M`,
+`G`, `T`, or `P`. This option is unavailable for ganon and `--use-k2`.
+
 ```bash
 taxaforge build --tool ganon2 \
   --assembly-accessions-file /path/to/250k_genomes.txt \
@@ -116,6 +136,134 @@ taxaforge config set threads 8
 taxaforge config get threads
 taxaforge config
 ```
+
+Download taxonomy
+=================
+
+Download or reuse TaxaForge's taxonomy dump and nucleotide accession-to-taxid
+maps. These files are required when `extract-library-species` uses its default
+taxonomy mode:
+
+```bash
+taxaforge download-taxonomy
+```
+
+Use `--cache-dir` to store or reuse taxonomy data outside the configured cache:
+
+```bash
+taxaforge download-taxonomy --cache-dir /path/to/cache
+```
+
+Analyze a genome directory
+==========================
+
+Count supported FASTA files by organism-group folder without reading their contents. The scan supports `.fa`, `.fasta`, `.fna` (including gzip-compressed variants), and `.zip` files, and is suitable for large collections:
+
+```bash
+taxaforge analyze-genomes /path/to/genomes
+```
+
+The command refreshes a live scan count and group totals every 1,000 filesystem files, so large scans show ongoing progress. It looks for recognized group names such as `viral`, `bacteria`, or `archaea` in the scanned directory path and its descendants, so an assembly folder such as `/refseq/archaea/GCF_...` is classified as `archaea`. Files with no recognized group in their path are counted as `unclassified`; the command does not infer taxonomy from FASTA contents or filenames.
+
+Create a library report
+=======================
+
+Create a CSV library report from every record in plain or gzip-compressed
+FASTA files beneath a directory:
+
+```bash
+taxaforge create-library-report /path/to/genomes \
+  --output library_report.csv --workers 8
+```
+
+The report contains `#Library`, `Sequence Name`, and `URL` columns. TaxaForge
+uses the FASTA header as `Sequence Name`, writes the local file URI as `URL`,
+and infers `#Library` from a recognized organism-group directory in the file's
+path; files outside one are marked `unclassified`. The generated CSV can be
+used directly with `extract-library-species`. Without taxonomy resolution it
+streams rows to disk and uses the smaller of eight workers or the detected CPU
+count minus four (at least one), keeping memory bounded and avoiding excess
+disk contention on large machines. Set `--workers` to match the CPU and
+storage bandwidth available to the job. Use `--limit N` to process only the
+first `N` FASTA files (each selected file contributes all of its sequence
+records). For genome-level comparisons, use `--one-per-file` to write only
+the first FASTA record from each genome file. Pair that report with
+`extract-library-species --taxonomy-dir ...` to produce a compact,
+canonical-species summary for comparison with
+`data/standard/unique-library-species.tsv`.
+
+For a flat collection such as `250K_Genomes`, pass the TaxaForge taxonomy
+directory to classify otherwise-unclassified records from their sequence
+accessions:
+
+```bash
+taxaforge create-library-report /media/HD/anand/250K_Genomes \
+  --taxonomy-dir /path/to/cache/taxonomy \
+  --output data/250k/library_report.csv --one-per-file --workers 8
+```
+
+The taxonomy directory must contain `nodes.dmp`, `nucl_gb.accession2taxid`,
+and `nucl_wgs.accession2taxid`; run `taxaforge download-taxonomy` first if
+the maps are absent. If a sequence accession is absent from those maps,
+TaxaForge also resolves a `GCF_` or `GCA_` accession in the genome filename
+through any cached `assembly_summary_*.txt` files in that directory.
+
+Extract unique Kraken species
+==============================
+
+Extract the distinct taxids at Kraken's `S` species rank from an inspect report:
+
+```bash
+taxaforge extract-kraken-species data/plusPF/inspect-ppf.txt \
+  --output data/plusPF/unique-species.tsv
+```
+
+The output is a TSV with `taxid`, `rank`, and `name` columns. Kraken places
+many viral species and strain-level taxa at `S1`; include those explicitly when
+needed:
+
+```bash
+taxaforge extract-kraken-species data/plusPF/inspect-ppf.txt \
+  --output data/plusPF/unique-species-and-s1.tsv --include-s1
+```
+
+Extract species represented by a Kraken library
+===============================================
+
+`library_report.tsv` contains sequence records and does not have taxids, so
+TaxaForge resolves its leading organism names against an inspect report and
+counts the matched records for each species:
+
+```bash
+taxaforge extract-library-species data/plusPF/library_report.tsv \
+  --inspect-file data/plusPF/inspect-ppf.txt \
+  --output data/plusPF/unique-library-species.tsv --include-s1 \
+  --workers 8
+```
+
+The output contains `taxid`, `rank`, `name`, and `library_entries`. Records
+whose labels use taxonomy synonyms, renamed taxa, or non-species descriptions
+are reported as unmatched rather than silently assigned to an incorrect taxon.
+TaxaForge uses up to eight CPU workers by default. Use `--workers` to reduce
+CPU use or to match the CPUs allocated to the job. For large taxonomy
+accession maps, workers are distributed across byte ranges in both map files,
+so a higher value can use more than two CPU cores.
+
+Alternatively, use TaxaForge's downloaded taxonomy files. This uses the
+nucleotide accession-to-taxid maps and taxonomy lineage, rather than display
+names, and does not require an inspect report:
+
+```bash
+taxaforge extract-library-species data/plusPF/library_report.tsv \
+  --taxonomy-dir /path/to/cache/taxonomy \
+  --output data/plusPF/unique-library-species.tsv --workers 8
+```
+
+The taxonomy directory must contain `nodes.dmp`, `names.dmp`,
+`nucl_gb.accession2taxid`, and `nucl_wgs.accession2taxid`. The accession maps
+are unavailable when the original build used `--skip-maps`. When neither
+`--taxonomy-dir` nor `--inspect-file` is supplied, TaxaForge defaults to the
+`taxonomy` directory in its configured cache.
 
 
 Why TaxaForge?

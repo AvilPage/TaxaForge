@@ -6,6 +6,7 @@ import datetime
 import gzip
 import hashlib
 import importlib.metadata
+import itertools
 import logging
 import multiprocessing
 import os
@@ -21,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from collections import deque
 from pathlib import Path
 
 import click
@@ -35,6 +37,14 @@ logger.addHandler(logging.StreamHandler())
 NCBI_SERVER = "https://ftp.ncbi.nlm.nih.gov"
 DOWNLOAD_ATTEMPTS = 3
 MAX_DOWNLOAD_THREADS = 4
+KRAKEN2_DEFAULT_MINIMIZER_SPACES = 7
+DEFAULT_EXTRACTION_WORKERS = max(1, min(8, multiprocessing.cpu_count()))
+DEFAULT_LIBRARY_REPORT_WORKERS = max(
+    1, min(8, multiprocessing.cpu_count() - 4)
+)
+EXTRACTION_CHUNK_SIZE = 1000
+LIBRARY_REPORT_BATCH_SIZE = 500
+ACCESSION_MAP_PARALLEL_MIN_BYTES = 16 * 1024 * 1024
 
 
 DB_TYPE_CONFIG = {
@@ -59,6 +69,18 @@ def hash_file(filename, buf_size=8192):
             md5.update(data)
     digest = md5.hexdigest()
     return digest
+
+
+def parse_max_db_size(context, parameter, value):
+    if value is None:
+        return None
+
+    value = value.upper()
+    if not re.fullmatch(r"[1-9]\d*(?:[KMGTP]?)", value):
+        raise click.BadParameter(
+            "must be a positive byte count optionally suffixed with K, M, G, T, or P"
+        )
+    return value
 
 
 def run_basic_checks(tool, use_k2=False):
@@ -174,6 +196,28 @@ def download_files(urls, max_workers=4):
             future.result()
 
 
+def validate_gzip_file(compressed_path):
+    with gzip.open(compressed_path, "rb") as compressed_file:
+        while compressed_file.read(1024 * 1024):
+            pass
+
+
+def decompress_gzip_file_atomically(compressed_path):
+    decompressed_path = compressed_path.with_suffix("")
+    temporary_path = decompressed_path.with_name(
+        f"{decompressed_path.name}.partial"
+    )
+    try:
+        with gzip.open(compressed_path, "rb") as compressed_file, temporary_path.open(
+            "wb"
+        ) as decompressed_file:
+            shutil.copyfileobj(compressed_file, decompressed_file)
+        temporary_path.replace(decompressed_path)
+    except (EOFError, gzip.BadGzipFile, zlib.error):
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def download_taxanomy(cache_dir, skip_maps=None, protein=None):
     taxonomy_path = os.path.join(cache_dir, "taxonomy")
     os.makedirs(taxonomy_path, exist_ok=True)
@@ -182,6 +226,7 @@ def download_taxanomy(cache_dir, skip_maps=None, protein=None):
 
     try:
         urls = []
+        map_urls = []
         if not skip_maps:
             if not protein:
                 # Define URLs for nucleotide accession to taxon map
@@ -231,11 +276,52 @@ def download_taxanomy(cache_dir, skip_maps=None, protein=None):
             if compressed_path.name == "taxdump.tar.gz":
                 continue
             decompressed_path = compressed_path.with_suffix("")
-            if decompressed_path.exists():
+            completion_marker = decompressed_path.with_name(
+                f"{decompressed_path.name}.complete"
+            )
+            if decompressed_path.exists() and completion_marker.exists():
                 continue
-            with gzip.open(compressed_path, "rb") as compressed_file:
-                with decompressed_path.open("wb") as decompressed_file:
-                    shutil.copyfileobj(compressed_file, decompressed_file)
+
+            try:
+                if decompressed_path.exists():
+                    validate_gzip_file(compressed_path)
+                else:
+                    decompress_gzip_file_atomically(compressed_path)
+            except (EOFError, gzip.BadGzipFile, zlib.error):
+                decompressed_path.unlink(missing_ok=True)
+                completion_marker.unlink(missing_ok=True)
+                source_url = next(
+                    (url for url in map_urls if url.endswith(compressed_path.name)),
+                    None,
+                )
+                if source_url is None:
+                    raise click.ClickException(
+                        f"Compressed taxonomy file is corrupt: {compressed_path}"
+                    )
+                logger.warning(
+                    f"Incomplete taxonomy map {compressed_path.name}; "
+                    "resuming its download"
+                )
+                download_file(source_url, 0)
+                try:
+                    decompress_gzip_file_atomically(compressed_path)
+                except (EOFError, gzip.BadGzipFile, zlib.error) as error:
+                    compressed_path.unlink(missing_ok=True)
+                    logger.warning(
+                        f"Resumed taxonomy map {compressed_path.name} is still "
+                        "corrupt; downloading a fresh copy"
+                    )
+                    try:
+                        download_file(source_url, 0)
+                        decompress_gzip_file_atomically(compressed_path)
+                    except (
+                        EOFError, gzip.BadGzipFile, zlib.error
+                    ) as retry_error:
+                        compressed_path.unlink(missing_ok=True)
+                        raise click.ClickException(
+                            f"Downloaded taxonomy map is corrupt: {compressed_path}"
+                        ) from retry_error
+            completion_marker.touch()
 
         logger.info("Finished downloading taxonomy data")
     finally:
@@ -827,7 +913,9 @@ def download_genomes(cache_dir, cwd, db_type, db_name, threads, force=False, see
 
 def build_db(
         cache_dir, cwd, db_type, db_name, threads, kmer_len, min_len,
-        fast_build, rebuild, load_factor, use_k2
+        fast_build, rebuild, load_factor, use_k2,
+        minimizer_spaces=KRAKEN2_DEFAULT_MINIMIZER_SPACES,
+        max_db_size=None,
 ):
     run_cmd(f"cd {cwd}")
 
@@ -848,7 +936,13 @@ def build_db(
     else:
         cmd = f"kraken2-build --build"
 
-    cmd += f" --db {db_name} --threads {threads} --kmer-len {kmer_len} --minimizer-len {min_len} --load-factor {load_factor}"
+    cmd += (
+        f" --db {db_name} --threads {threads} --kmer-len {kmer_len}"
+        f" --minimizer-len {min_len} --minimizer-spaces {minimizer_spaces}"
+        f" --load-factor {load_factor}"
+    )
+    if max_db_size:
+        cmd += f" --max-db-size {max_db_size}"
     if fast_build:
         cmd += " --fast-build"
 
@@ -1473,6 +1567,18 @@ ORGANISM_GROUPS = [
     'archaea', 'bacteria', 'fungi', 'human', 'invertebrate', 'metagenomes',
     'other', 'plant', 'protozoa', 'vertebrate_mammalian', 'vertebrate_other', 'viral',
 ]
+LIBRARY_GROUP_TAXIDS = (
+    ("human", "9606"),
+    ("vertebrate_mammalian", "40674"),
+    ("vertebrate_other", "7742"),
+    ("invertebrate", "33208"),
+    ("fungi", "4751"),
+    ("plant", "33090"),
+    ("protozoa", "5794"),
+    ("viral", "10239"),
+    ("archaea", "2157"),
+    ("bacteria", "2"),
+)
 SOURCE_ALIASES = {'rs': 'refseq', 'gb': 'genbank'}
 BOOL_FLAG_ALIASES = {'rg': 'reference-genomes', 'cg': 'complete-genomes'}
 FILTER_CODE_EXPR = {'rg': '$5 == "reference genome"', 'cg': '$12 == "Complete Genome"'}
@@ -1612,8 +1718,10 @@ def cli():
 @click.option('--download-threads', default=None, type=click.IntRange(min=1, max=MAX_DOWNLOAD_THREADS), help=f'Number of parallel workers for downloading genomes (maximum {MAX_DOWNLOAD_THREADS}).')
 @click.option('--build-threads', default=None, type=click.IntRange(min=1), help='Number of threads for adding genomes and building the index.')
 @click.option('--load-factor', default=0.7, help='Proportion of the hash table to be populated. Used only for kraken2')
+@click.option('--max-db-size', default=None, callback=parse_max_db_size, help='Maximum Kraken2 hash table size (for example, 50G).')
 @click.option('--kmer-len', default=None, help='Override ganon k-mer size; otherwise use its default. Kraken2 defaults to 35.', type=int)
-@click.option('--min-len', default=None, help='Override ganon window size; otherwise use its default. Kraken2 defaults to 31.', type=int)
+@click.option('--min-len', '--minimizer-len', 'min_len', default=None, help='Override ganon window size or Kraken2 minimizer length. Kraken2 defaults to 31.', type=int)
+@click.option('--minimizer-spaces', default=None, type=click.IntRange(min=0), help='Kraken2 minimizer spaces (default 7, automatically reduced if the minimizer is too short).')
 @click.option('--level', default=None, type=click.Choice(['leaves', 'species', 'genus', 'assembly', 'file']), help='Override ganon taxonomic level; otherwise use its default.')
 @click.option('--limit', default=None, help='Limit number of genomes to use', type=int)
 @click.option('--from', 'from_idx', default=None, help='Start index of genome files range, for testing a small slice first. Used only for kraken2', type=int)
@@ -1630,7 +1738,7 @@ def build(
         context,
         tool: str, backend, db_type: str, db_name, cache_dir, output_dir, genomes_dir, genomes_cache_dir, assembly_accessions_file,
         nextflow_bin, createtaxdb_pipeline, pipeline_revision, resume, seed_dirs,
-        threads, download_threads, build_threads, load_factor, kmer_len: int, min_len, level: str, limit: int, from_idx: int, to_idx: int, batch_size: int,
+        threads, download_threads, build_threads, load_factor, max_db_size, kmer_len: int, min_len, minimizer_spaces, level: str, limit: int, from_idx: int, to_idx: int, batch_size: int,
         input_file, download_missing,
         force: bool, rebuild, fast_build: bool, use_k2: bool, download_only: bool, ganon_args
 ):
@@ -1668,6 +1776,10 @@ def build(
         raise click.UsageError("--input-file is supported only with --tool ganon or --tool ganon2")
     if input_file and backend != "direct":
         raise click.UsageError("--input-file cannot be used with --backend createtaxdb")
+    if max_db_size and tool != "kraken2":
+        raise click.UsageError("--max-db-size is only available with --tool kraken2")
+    if max_db_size and use_k2:
+        raise click.UsageError("--max-db-size cannot be combined with --use-k2")
     if assembly_accessions_file:
         try:
             read_assembly_accessions(assembly_accessions_file, limit)
@@ -1690,6 +1802,31 @@ def build(
         # ganon's own default k-mer size is 19; kraken2-build's is 35. Use whichever
         # matches the selected tool instead of forcing one default on both.
         kmer_len = 19 if tool in ('ganon', 'ganon2') else 35
+
+    if tool == 'kraken2':
+        min_len = 31 if min_len is None else min_len
+        if min_len > kmer_len:
+            logger.warning(
+                f"--minimizer-len {min_len} exceeds --kmer-len {kmer_len}; "
+                f"reducing --minimizer-len to {kmer_len} for Kraken2"
+            )
+            min_len = kmer_len
+        max_minimizer_spaces = min_len // 4
+        if minimizer_spaces is None:
+            minimizer_spaces = min(
+                KRAKEN2_DEFAULT_MINIMIZER_SPACES, max_minimizer_spaces
+            )
+            if minimizer_spaces < KRAKEN2_DEFAULT_MINIMIZER_SPACES:
+                logger.warning(
+                    f"Kraken2 allows at most {max_minimizer_spaces} minimizer "
+                    f"spaces for --minimizer-len {min_len}; reducing the default "
+                    f"from {KRAKEN2_DEFAULT_MINIMIZER_SPACES}"
+                )
+        elif minimizer_spaces > max_minimizer_spaces:
+            raise click.UsageError(
+                f"--minimizer-spaces {minimizer_spaces} exceeds the maximum "
+                f"{max_minimizer_spaces} for --minimizer-len {min_len}"
+            )
 
     if tool in ('ganon', 'ganon2') and ganon_args and not assembly_accessions_file:
         logger.info(f"Passing through unrecognized options to native ganon build: {' '.join(ganon_args)}")
@@ -1801,14 +1938,14 @@ def build(
 
     if tool == 'kraken2':
         kmer_len = 35 if kmer_len is None else kmer_len
-        min_len = 31 if min_len is None else min_len
         add_to_library(
             cache_dir, cwd, genomes_dir, db_type, db_name,
             limit, from_idx, to_idx, batch_size, threads, use_k2
         )
         build_db(
             cache_dir, cwd, db_type, db_name, threads, kmer_len, min_len,
-            fast_build, rebuild, load_factor, use_k2
+            fast_build, rebuild, load_factor, use_k2, minimizer_spaces,
+            max_db_size=max_db_size,
         )
     elif tool == 'ganon2':
         if backend == "createtaxdb":
@@ -1864,6 +2001,22 @@ def config_set(key, value):
     parser.set(CONFIG_SECTION, key, value)
     save_config(parser)
     logger.info(f"Set {key} = {value}")
+
+
+@cli.command(name="download-taxonomy")
+@click.option(
+    "--cache-dir",
+    default=lambda: load_config().get(
+        CONFIG_SECTION, "cache-dir", fallback=str(create_cache_dir())
+    ),
+    show_default="configured cache directory",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="TaxaForge cache directory containing taxonomy data.",
+)
+def download_taxonomy(cache_dir):
+    """Ensure Kraken taxonomy and nucleotide accession maps are downloaded."""
+    download_taxanomy(cache_dir)
+    logger.info(f"Taxonomy is ready in {cache_dir / 'taxonomy'}")
 
 
 @cli.command(name='createtaxdb-input')
@@ -1969,6 +2122,931 @@ def genome_cache_status(cache_dir):
         avg_size = total_size / len(sizes) if sizes else 0
         status[group_dir.name] = (len(sizes), total_size, avg_size)
     return status
+
+
+FASTA_FILE_SUFFIXES = (
+    ".fa", ".fasta", ".fna", ".fas", ".ffn", ".fsa",
+    ".fa.gz", ".fasta.gz", ".fna.gz", ".fas.gz", ".ffn.gz", ".fsa.gz",
+    ".zip",
+)
+FASTA_REPORT_SUFFIXES = FASTA_FILE_SUFFIXES[:-1]
+GENOME_GROUP_ALIASES = {"viruses": "viral"}
+
+
+def _genome_group_from_path(path_parts):
+    for part in reversed(path_parts):
+        group = part.casefold().replace("-", "_")
+        group = GENOME_GROUP_ALIASES.get(group, group)
+        if group in ORGANISM_GROUPS:
+            return group
+    return "unclassified"
+
+
+def analyze_genome_directory(
+    input_dir, progress_callback=None, progress_interval=1000
+):
+    """Count FASTA files by group inferred from group-named directories."""
+    if progress_interval < 1:
+        raise ValueError("progress_interval must be at least 1")
+
+    root = Path(input_dir).expanduser().resolve()
+    counts = {}
+    scanned = 0
+    for current_dir, _, filenames in os.walk(root):
+        relative_parts = Path(current_dir).relative_to(root).parts
+        group = _genome_group_from_path(root.parts + relative_parts)
+        for filename in filenames:
+            if filename.casefold().endswith(FASTA_FILE_SUFFIXES):
+                counts[group] = counts.get(group, 0) + 1
+            scanned += 1
+            if progress_callback and scanned % progress_interval == 0:
+                progress_callback(scanned, counts.copy())
+    if progress_callback and scanned % progress_interval:
+        progress_callback(scanned, counts.copy())
+    return counts
+
+
+def fasta_report_files(input_dir):
+    root = Path(input_dir).expanduser().resolve()
+    for current_dir, directory_names, filenames in os.walk(root):
+        directory_names.sort()
+        for filename in sorted(filenames):
+            if filename.casefold().endswith(FASTA_REPORT_SUFFIXES):
+                yield Path(current_dir) / filename
+
+
+def fasta_headers(fasta_path, limit=None):
+    opener = gzip.open if fasta_path.name.casefold().endswith(".gz") else open
+    headers = []
+    saw_content = False
+    with opener(fasta_path, "rt", encoding="utf-8") as source:
+        for line_number, line in enumerate(source, start=1):
+            content = line.strip()
+            if not content:
+                continue
+            saw_content = True
+            if content.startswith(">"):
+                header = content[1:].strip()
+                if not header:
+                    raise ValueError(
+                        f"Empty FASTA header on line {line_number} of {fasta_path}"
+                    )
+                headers.append(header)
+                if limit is not None and len(headers) >= limit:
+                    return headers
+            elif not headers:
+                raise ValueError(
+                    f"Expected a FASTA header on line {line_number} of {fasta_path}"
+                )
+    if saw_content and not headers:
+        raise ValueError(f"No FASTA headers found in {fasta_path}")
+    return headers
+
+
+def library_report_rows_for_batch(fasta_paths, root, one_per_file=False):
+    rows = []
+    for fasta_path in fasta_paths:
+        group = _genome_group_from_path(
+            fasta_path.relative_to(root).parts[:-1]
+        )
+        headers = fasta_headers(
+            fasta_path, limit=1 if one_per_file else None
+        )
+        rows.extend(
+            (group, header, fasta_path.as_uri())
+            for header in headers
+        )
+    return rows
+
+
+def library_group_from_taxid(taxid, nodes, cache):
+    if taxid in cache:
+        return cache[taxid]
+
+    lineage = []
+    seen = set()
+    current = taxid
+    while current not in seen:
+        seen.add(current)
+        lineage.append(current)
+        node = nodes.get(current)
+        if node is None or node[0] == current:
+            break
+        current = node[0]
+
+    lineage_taxids = set(lineage)
+    group = next(
+        (
+            group
+            for group, ancestor_taxid in LIBRARY_GROUP_TAXIDS
+            if ancestor_taxid in lineage_taxids
+        ),
+        "unclassified",
+    )
+    for descendant in lineage:
+        cache[descendant] = group
+    return group
+
+
+def library_assembly_accession(url):
+    match = re.search(r"(GC[AF]_\d+\.\d+)", url)
+    return match.group(1) if match else None
+
+
+def resolve_library_assembly_accessions(rows, taxonomy_dir):
+    accessions = {
+        accession
+        for row in rows
+        if (accession := library_assembly_accession(row[2]))
+    }
+    summary_paths = sorted(taxonomy_dir.glob("assembly_summary_*.txt"))
+    if not accessions or not summary_paths:
+        return {}
+    return build_accession_taxid_map(summary_paths, accessions)
+
+
+def classify_library_report_rows(rows, taxonomy_dir, workers=1):
+    """Classify unclassified report rows from their sequence accessions."""
+    accession_to_taxid = resolve_library_accessions(
+        rows, taxonomy_dir, workers
+    )
+    unresolved_rows = [
+        row
+        for row in rows
+        if row[0] == "unclassified"
+        and library_record_accession(row[1]) not in accession_to_taxid
+    ]
+    assembly_accession_to_taxid = resolve_library_assembly_accessions(
+        unresolved_rows, taxonomy_dir
+    )
+    nodes = parse_taxonomy_nodes(taxonomy_dir)
+    cache = {}
+    classified = []
+    unresolved = 0
+
+    for library, sequence_name, url in rows:
+        if library != "unclassified":
+            classified.append((library, sequence_name, url))
+            continue
+
+        accession = library_record_accession(sequence_name)
+        taxid = accession_to_taxid.get(accession) or (
+            assembly_accession_to_taxid.get(
+                library_assembly_accession(url)
+            )
+        )
+        group = (
+            library_group_from_taxid(taxid, nodes, cache)
+            if taxid is not None
+            else "unclassified"
+        )
+        if group == "unclassified":
+            unresolved += 1
+        classified.append((group, sequence_name, url))
+
+    return classified, unresolved
+
+
+def fasta_report_file_batches(input_dir, limit=None):
+    files = fasta_report_files(input_dir)
+    if limit is not None:
+        files = itertools.islice(files, limit)
+    files = iter(files)
+    while batch := list(itertools.islice(files, LIBRARY_REPORT_BATCH_SIZE)):
+        yield batch
+
+
+def iter_library_report_rows(
+    input_dir, workers=1, limit=None, one_per_file=False
+):
+    """Yield library-report rows without retaining the entire report in memory."""
+    root = Path(input_dir).expanduser().resolve()
+    batches = iter(fasta_report_file_batches(root, limit))
+    if workers == 1:
+        for batch in batches:
+            yield from library_report_rows_for_batch(
+                batch, root, one_per_file
+            )
+        return
+
+    max_pending_batches = workers * 4
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        pending = deque()
+
+        def submit_batches():
+            for batch in itertools.islice(
+                batches, max_pending_batches - len(pending)
+            ):
+                pending.append(
+                    executor.submit(
+                        library_report_rows_for_batch,
+                        batch,
+                        root,
+                        one_per_file,
+                    )
+                )
+
+        submit_batches()
+        while pending:
+            yield from pending.popleft().result()
+            submit_batches()
+
+
+def create_library_report(
+    input_dir, workers=1, limit=None, one_per_file=False
+):
+    """Return library-report rows for all FASTA records under input_dir."""
+    return list(
+        iter_library_report_rows(input_dir, workers, limit, one_per_file)
+    )
+
+
+def extract_kraken_species(inspect_file, include_s1=False):
+    """Return distinct species taxids and names from Kraken inspect output."""
+    accepted_ranks = {"S", "S1"} if include_s1 else {"S"}
+    taxa = {}
+
+    with open(inspect_file, encoding="utf-8") as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip() or line.startswith("#"):
+                continue
+
+            fields = line.rstrip("\n").split("\t", 5)
+            if len(fields) != 6:
+                raise ValueError(
+                    f"Expected 6 tab-separated fields on line {line_number}"
+                )
+
+            rank = fields[3]
+            taxid = fields[4].strip()
+            if not taxid.isdigit():
+                raise ValueError(
+                    f"Invalid taxid {taxid!r} on line {line_number}"
+                )
+            if rank in accepted_ranks:
+                taxa[taxid] = (rank, fields[5].strip())
+
+    return [
+        (taxid, rank, name)
+        for taxid, (rank, name) in sorted(taxa.items(), key=lambda item: int(item[0]))
+    ]
+
+
+def normalize_taxon_name(name):
+    return " ".join(name.casefold().replace("[", "").replace("]", "").split())
+
+
+def library_species_prefixes(sequence_name, max_words=12):
+    """Yield normalized leading organism-name candidates from a library label."""
+    parts = sequence_name.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return
+
+    description = parts[1]
+    if description.startswith("MAG: "):
+        description = description[5:]
+    words = description.split()
+    for word_count in range(1, min(max_words, len(words)) + 1):
+        yield normalize_taxon_name(
+            " ".join(words[:word_count]).rstrip(",.;")
+        )
+
+
+def read_library_report(library_report):
+    with open(library_report, newline="", encoding="utf-8") as source:
+        sample = source.read(4096)
+        source.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters="\t,")
+        except csv.Error:
+            dialect = csv.excel_tab
+        reader = csv.reader(source, dialect)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError("Library report is empty")
+        if header != ["#Library", "Sequence Name", "URL"]:
+            raise ValueError(
+                "Expected header '#Library\\tSequence Name\\tURL'"
+            )
+
+        rows = []
+        for line_number, row in enumerate(reader, start=2):
+            if len(row) != 3:
+                raise ValueError(
+                    f"Expected 3 tab-separated fields on line {line_number}"
+                )
+            rows.append(row)
+    return rows
+
+
+def count_library_species_rows(rows, taxa):
+    counts = {}
+    unmatched = 0
+
+    for row in rows:
+        match = None
+        for candidate in library_species_prefixes(row[1]):
+            if candidate in taxa:
+                match = taxa[candidate]
+        if match is None:
+            unmatched += 1
+            continue
+
+        counts[match] = counts.get(match, 0) + 1
+
+    return counts, unmatched
+
+
+library_taxa = None
+
+
+def initialize_library_taxa(taxa):
+    global library_taxa
+    library_taxa = taxa
+
+
+def count_library_species_chunk(rows):
+    return count_library_species_rows(rows, library_taxa)
+
+
+def combine_library_species_counts(results):
+    counts = {}
+    unmatched = 0
+    for chunk_counts, chunk_unmatched in results:
+        unmatched += chunk_unmatched
+        for taxon, count in chunk_counts.items():
+            counts[taxon] = counts.get(taxon, 0) + count
+    return counts, unmatched
+
+
+def parallel_library_species_counts(rows, taxa, workers):
+    if workers == 1 or len(rows) < EXTRACTION_CHUNK_SIZE:
+        return count_library_species_rows(rows, taxa)
+
+    chunks = [
+        rows[index : index + EXTRACTION_CHUNK_SIZE]
+        for index in range(0, len(rows), EXTRACTION_CHUNK_SIZE)
+    ]
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=min(workers, len(chunks)),
+        initializer=initialize_library_taxa,
+        initargs=(taxa,),
+    ) as executor:
+        return combine_library_species_counts(
+            executor.map(count_library_species_chunk, chunks)
+        )
+
+
+def extract_library_species(
+    library_report, inspect_file, include_s1=False, workers=1
+):
+    """Resolve library records to distinct Kraken species taxids by name."""
+    taxa = {
+        normalize_taxon_name(name): (taxid, rank, name)
+        for taxid, rank, name in extract_kraken_species(inspect_file, include_s1)
+    }
+    counts, unmatched = parallel_library_species_counts(
+        read_library_report(library_report), taxa, workers
+    )
+
+    rows = [
+        (taxid, rank, name, count)
+        for (taxid, rank, name), count in counts.items()
+    ]
+    rows.sort(key=lambda row: int(row[0]))
+    return rows, unmatched
+
+
+def library_record_accession(sequence_name):
+    parts = sequence_name.strip().split(maxsplit=1)
+    return parts[0] if len(parts) == 2 else None
+
+
+def parse_taxonomy_nodes(taxonomy_dir):
+    nodes_path = taxonomy_dir / "nodes.dmp"
+    if not nodes_path.is_file():
+        raise ValueError(f"Missing taxonomy nodes file: {nodes_path}")
+
+    nodes = {}
+    with open(nodes_path, encoding="utf-8") as source:
+        for line_number, line in enumerate(source, start=1):
+            fields = line.rstrip("\t|\n").split("\t|\t")
+            if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
+                raise ValueError(
+                    f"Invalid taxonomy node on line {line_number} of {nodes_path}"
+                )
+            nodes[fields[0]] = (fields[1], fields[2])
+    return nodes
+
+
+def parse_taxonomy_names(taxonomy_dir, taxids):
+    names_path = taxonomy_dir / "names.dmp"
+    if not names_path.is_file():
+        raise ValueError(f"Missing taxonomy names file: {names_path}")
+
+    names = {}
+    with open(names_path, encoding="utf-8") as source:
+        for line in source:
+            fields = line.rstrip("\t|\n").split("\t|\t")
+            if (
+                len(fields) >= 4
+                and fields[0] in taxids
+                and fields[3] == "scientific name"
+            ):
+                names[fields[0]] = fields[1]
+    return names
+
+
+def resolve_accession_taxids_range(
+    map_path, start, end, wanted, base_accessions
+):
+    accession_to_taxid = {}
+    with open(map_path, "rb") as source:
+        source.seek(start)
+        if start:
+            source.seek(start - 1)
+            if source.read(1) != b"\n":
+                source.readline()
+            else:
+                source.seek(start)
+        while end is None or source.tell() < end:
+            line = source.readline()
+            if not line:
+                break
+            fields = line.rstrip(b"\n").split(b"\t")
+            if len(fields) < 3 or fields[0] == b"accession":
+                continue
+            accession, accession_version, taxid = fields[:3]
+            if not taxid.isdigit():
+                continue
+            if accession_version in wanted:
+                accession_to_taxid[wanted[accession_version]] = taxid.decode(
+                    "ascii"
+                )
+            elif accession in base_accessions:
+                for library_accession in base_accessions[accession]:
+                    accession_to_taxid[library_accession] = taxid.decode("ascii")
+    return accession_to_taxid
+
+
+accession_wanted = None
+accession_base_accessions = None
+
+
+def initialize_accession_maps(wanted, base_accessions):
+    global accession_wanted
+    global accession_base_accessions
+    accession_wanted = wanted
+    accession_base_accessions = base_accessions
+
+
+def resolve_accession_taxids_chunk(task):
+    map_path, start, end = task
+    return resolve_accession_taxids_range(
+        map_path, start, end, accession_wanted, accession_base_accessions
+    )
+
+
+def accession_map_ranges(map_path, parts):
+    file_size = map_path.stat().st_size
+    if parts == 1 or file_size == 0:
+        return [(map_path, 0, None)]
+
+    chunk_size = (file_size + parts - 1) // parts
+    return [
+        (map_path, start, min(start + chunk_size, file_size))
+        for start in range(0, file_size, chunk_size)
+    ]
+
+
+def accession_map_workers(map_paths, workers):
+    sizes = {map_path: map_path.stat().st_size for map_path in map_paths}
+    total_size = sum(sizes.values())
+    if workers == 1 or total_size < ACCESSION_MAP_PARALLEL_MIN_BYTES:
+        return {map_path: 1 for map_path in map_paths}
+
+    worker_counts = {map_path: 1 for map_path in map_paths}
+    for _ in range(workers - len(map_paths)):
+        map_path = max(
+            map_paths,
+            key=lambda path: sizes[path] / worker_counts[path],
+        )
+        worker_counts[map_path] += 1
+    return worker_counts
+
+
+def resolve_library_accessions(rows, taxonomy_dir, workers=1):
+    wanted = {
+        accession
+        for row in rows
+        if (accession := library_record_accession(row[1]))
+    }
+    base_accessions = {}
+    for accession in wanted:
+        base_accessions.setdefault(accession.rsplit(".", 1)[0], []).append(
+            accession
+        )
+    encoded_wanted = {
+        accession.encode("utf-8"): accession for accession in wanted
+    }
+    encoded_base_accessions = {
+        accession.encode("utf-8"): library_accessions
+        for accession, library_accessions in base_accessions.items()
+    }
+
+    map_paths = [
+        taxonomy_dir / "nucl_gb.accession2taxid",
+        taxonomy_dir / "nucl_wgs.accession2taxid",
+    ]
+    missing_paths = [path for path in map_paths if not path.is_file()]
+    if missing_paths:
+        paths = ", ".join(str(path) for path in missing_paths)
+        raise ValueError(
+            "Missing nucleotide accession-to-taxid map(s): "
+            f"{paths}. Run a TaxaForge build without --skip-maps first."
+        )
+
+    worker_counts = accession_map_workers(map_paths, workers)
+    tasks = [
+        task
+        for map_path in map_paths
+        for task in accession_map_ranges(
+            map_path, worker_counts[map_path]
+        )
+    ]
+    if len(tasks) == 1:
+        map_results = [
+            resolve_accession_taxids_range(
+                *tasks[0], encoded_wanted, encoded_base_accessions
+            )
+        ]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=min(workers, len(tasks)),
+            initializer=initialize_accession_maps,
+            initargs=(encoded_wanted, encoded_base_accessions),
+        ) as executor:
+            map_results = list(executor.map(resolve_accession_taxids_chunk, tasks))
+
+    accession_to_taxid = {}
+    for map_path in map_paths:
+        for task, map_result in zip(tasks, map_results):
+            if task[0] == map_path:
+                accession_to_taxid.update(map_result)
+    return accession_to_taxid
+
+
+def species_ancestor(taxid, nodes, cache):
+    if taxid in cache:
+        return cache[taxid]
+
+    lineage = []
+    seen = set()
+    current = taxid
+    while current not in seen:
+        seen.add(current)
+        lineage.append(current)
+        node = nodes.get(current)
+        if node is None:
+            break
+        parent, rank = node
+        if rank == "species":
+            for descendant in lineage:
+                cache[descendant] = current
+            return current
+        if parent == current:
+            break
+        current = parent
+
+    for descendant in lineage:
+        cache[descendant] = None
+    return None
+
+
+taxonomy_nodes = None
+
+
+def initialize_taxonomy_nodes(nodes):
+    global taxonomy_nodes
+    taxonomy_nodes = nodes
+
+
+def resolve_species_taxids(taxids):
+    cache = {}
+    return {
+        taxid: species_ancestor(taxid, taxonomy_nodes, cache)
+        for taxid in taxids
+    }
+
+
+def parallel_species_ancestors(taxids, nodes, workers):
+    if workers == 1 or len(taxids) < EXTRACTION_CHUNK_SIZE:
+        cache = {}
+        return {
+            taxid: species_ancestor(taxid, nodes, cache) for taxid in taxids
+        }
+
+    chunks = [
+        taxids[index : index + EXTRACTION_CHUNK_SIZE]
+        for index in range(0, len(taxids), EXTRACTION_CHUNK_SIZE)
+    ]
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=min(workers, len(chunks)),
+        initializer=initialize_taxonomy_nodes,
+        initargs=(nodes,),
+    ) as executor:
+        resolved_chunks = executor.map(resolve_species_taxids, chunks)
+        return {
+            taxid: species_taxid
+            for resolved_chunk in resolved_chunks
+            for taxid, species_taxid in resolved_chunk.items()
+        }
+
+
+def extract_library_species_from_taxonomy(
+    library_report, taxonomy_dir, workers=1
+):
+    """Resolve library accessions to species with TaxaForge taxonomy maps."""
+    rows = read_library_report(library_report)
+    accession_to_taxid = resolve_library_accessions(
+        rows, taxonomy_dir, workers
+    )
+    nodes = parse_taxonomy_nodes(taxonomy_dir)
+    taxids = sorted(
+        {
+            taxid
+            for row in rows
+            if (accession := library_record_accession(row[1]))
+            if (taxid := accession_to_taxid.get(accession))
+        },
+        key=int,
+    )
+    species_taxids = parallel_species_ancestors(taxids, nodes, workers)
+    resolved = []
+    unmatched = 0
+
+    for row in rows:
+        accession = library_record_accession(row[1])
+        taxid = accession_to_taxid.get(accession)
+        species_taxid = species_taxids.get(taxid)
+        if species_taxid is None:
+            unmatched += 1
+            continue
+        resolved.append(species_taxid)
+
+    names = parse_taxonomy_names(taxonomy_dir, set(resolved))
+    counts = {}
+    for taxid in resolved:
+        if taxid in names:
+            counts[taxid] = counts.get(taxid, 0) + 1
+        else:
+            unmatched += 1
+
+    return [
+        (taxid, "species", names[taxid], count)
+        for taxid, count in sorted(counts.items(), key=lambda item: int(item[0]))
+    ], unmatched
+
+
+@cli.command(name="extract-kraken-species")
+@click.argument(
+    "inspect_file",
+    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+)
+@click.option(
+    "--output",
+    default="unique-species.tsv",
+    show_default=True,
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    help="TSV file to write (taxid, rank, name).",
+)
+@click.option(
+    "--include-s1",
+    is_flag=True,
+    help="Include Kraken S1 taxa, which contain many viral species and strains.",
+)
+def extract_kraken_species_command(inspect_file, output, include_s1):
+    """Extract unique species taxids from a Kraken inspect report."""
+    try:
+        taxa = extract_kraken_species(inspect_file, include_s1)
+    except ValueError as error:
+        raise click.ClickException(
+            f"Unable to parse Kraken inspect report: {error}"
+        ) from error
+
+    with open(output, "w", newline="", encoding="utf-8") as destination:
+        writer = csv.writer(destination, delimiter="\t", lineterminator="\n")
+        writer.writerow(("taxid", "rank", "name"))
+        writer.writerows(taxa)
+
+    logger.info(f"Wrote {len(taxa)} unique taxa to {output}")
+
+
+@cli.command(name="extract-library-species")
+@click.argument(
+    "library_report",
+    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+)
+@click.option(
+    "--inspect-file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+    help="Kraken inspect report that supplies canonical taxids and names.",
+)
+@click.option(
+    "--taxonomy-dir",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, readable=True, path_type=Path),
+    help="TaxaForge taxonomy directory with nodes, names, and nucleotide accession maps.",
+)
+@click.option(
+    "--output",
+    default="unique-library-species.tsv",
+    show_default=True,
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    help="TSV file to write (taxid, rank, name, library_entries).",
+)
+@click.option(
+    "--include-s1",
+    is_flag=True,
+    help="Include Kraken S1 taxa, which contain many viral species and strains.",
+)
+@click.option(
+    "--workers",
+    default=DEFAULT_EXTRACTION_WORKERS,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Number of CPU workers for library-record resolution.",
+)
+def extract_library_species_command(
+    library_report, inspect_file, taxonomy_dir, output, include_s1, workers
+):
+    """Extract unique library species using Kraken or TaxaForge taxonomy."""
+    if inspect_file and taxonomy_dir:
+        raise click.UsageError(
+            "Use either --inspect-file or --taxonomy-dir, not both"
+        )
+    if not inspect_file and taxonomy_dir is None:
+        cache_dir = load_config().get(
+            CONFIG_SECTION, "cache-dir", fallback=str(create_cache_dir())
+        )
+        taxonomy_dir = Path(cache_dir) / "taxonomy"
+    if taxonomy_dir and include_s1:
+        raise click.UsageError(
+            "--include-s1 is only available with --inspect-file"
+        )
+    try:
+        if inspect_file:
+            taxa, unmatched = extract_library_species(
+                library_report, inspect_file, include_s1, workers
+            )
+        else:
+            taxa, unmatched = extract_library_species_from_taxonomy(
+                library_report, taxonomy_dir, workers
+            )
+    except ValueError as error:
+        raise click.ClickException(
+            f"Unable to parse library report: {error}"
+        ) from error
+
+    with open(output, "w", newline="", encoding="utf-8") as destination:
+        writer = csv.writer(destination, delimiter="\t", lineterminator="\n")
+        writer.writerow(("taxid", "rank", "name", "library_entries"))
+        writer.writerows(taxa)
+
+    logger.info(f"Wrote {len(taxa)} unique taxa to {output}")
+    if unmatched:
+        if inspect_file:
+            logger.warning(
+                f"{unmatched} library records did not match an inspect taxon "
+                "name; they may use a synonym, a renamed taxon, or a "
+                "non-species label."
+            )
+        else:
+            logger.warning(
+                f"{unmatched} library records could not be resolved through "
+                "the accession maps to a species-level taxon."
+            )
+
+
+@cli.command(name="analyze-genomes")
+@click.argument(
+    "input_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+def analyze_genomes(input_dir):
+    """Count FASTA and ZIP genome files by organism-group directory."""
+    progress_shown = False
+
+    def show_progress(scanned, counts):
+        nonlocal progress_shown
+        progress_shown = True
+        groups = ", ".join(
+            f"{group}: {count}"
+            for group, count in sorted(counts.items())
+        ) or "none found yet"
+        sys.stdout.write(
+            f"\rScanned {scanned:,} files; genome files found: "
+            f"{sum(counts.values()):,} ({groups})"
+        )
+        sys.stdout.flush()
+
+    counts = analyze_genome_directory(input_dir, progress_callback=show_progress)
+    if progress_shown:
+        print()
+    if not counts:
+        logger.info(f"No FASTA or ZIP genome files found under {input_dir}")
+        return
+
+    rows = [
+        (group, str(count))
+        for group, count in sorted(counts.items(), key=lambda item: (item[0] == "unclassified", item[0]))
+    ]
+    headers = ("GROUP", "FILES")
+    widths = [
+        max(len(row[index]) for row in (headers, *rows))
+        for index in range(len(headers))
+    ]
+    print("  " + "  ".join(value.ljust(width) for value, width in zip(headers, widths)))
+    for row in rows:
+        print("  " + "  ".join(value.ljust(width) for value, width in zip(row, widths)))
+    print(f"\nTotal genome files: {sum(counts.values())}")
+    if counts.get("unclassified"):
+        logger.warning(
+            "Some files were not under a recognized organism-group directory; "
+            "they are counted as 'unclassified'."
+        )
+
+
+@cli.command(name="create-library-report")
+@click.argument(
+    "input_dir",
+    type=click.Path(exists=True, file_okay=False, readable=True, path_type=Path),
+)
+@click.option(
+    "--output",
+    default="library_report.csv",
+    show_default=True,
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    help="CSV file to write (#Library, Sequence Name, URL).",
+)
+@click.option(
+    "--workers",
+    default=DEFAULT_LIBRARY_REPORT_WORKERS,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Number of CPU workers used to read FASTA files.",
+)
+@click.option(
+    "--limit",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Maximum number of FASTA files to include.",
+)
+@click.option(
+    "--one-per-file",
+    is_flag=True,
+    help="Write only the first FASTA record from each file.",
+)
+@click.option(
+    "--taxonomy-dir",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, readable=True, path_type=Path),
+    help=(
+        "TaxaForge taxonomy directory used to classify files outside "
+        "organism-group directories from their sequence accessions."
+    ),
+)
+def create_library_report_command(
+    input_dir, output, workers, limit, one_per_file, taxonomy_dir
+):
+    """Create a library report from FASTA records in a directory."""
+    try:
+        rows = iter_library_report_rows(
+            input_dir, workers, limit, one_per_file
+        )
+        unresolved = 0
+        if taxonomy_dir:
+            rows, unresolved = classify_library_report_rows(
+                list(rows), taxonomy_dir, workers
+            )
+        with open(output, "w", newline="", encoding="utf-8") as destination:
+            writer = csv.writer(destination, lineterminator="\n")
+            writer.writerow(("#Library", "Sequence Name", "URL"))
+            records_written = 0
+            for row in rows:
+                writer.writerow(row)
+                records_written += 1
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise click.ClickException(f"Unable to read FASTA files: {error}") from error
+
+    logger.info(f"Wrote {records_written} FASTA records to {output}")
+    if taxonomy_dir and unresolved:
+        logger.warning(
+            f"{unresolved} FASTA records could not be classified from "
+            "their sequence accessions."
+        )
 
 
 @cli.command(name='doctor')
